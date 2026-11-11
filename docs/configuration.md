@@ -82,7 +82,9 @@ they use an injectable clock so tests can advance time without sleeping.
 | `registration_per_minute_per_source` | `10` | Registration rate limit per source (container). Exceeding returns `RATE_LIMITED` with `retry_after_s`. |
 | `registration_per_minute_global` | `60` | Global registration rate limit per minute. |
 | `requests_per_minute` | `60` | Per-session tool request rate limit. |
-| `request_burst` | `20` | Allowed burst above the sustained request rate. |
+| `request_burst` | `20` | Allowed burst above the sustained per-session request rate. |
+| `requests_per_minute_global` | `6000` | Process-wide tool request rate limit across all sessions. Admin socket calls are not counted. |
+| `request_burst_global` | `1000` | Allowed burst above the sustained global request rate. |
 | `candidate_writes_per_hour` | `20` | Candidate writes per agent per hour. Exceeding returns `BUDGET_EXCEEDED`. |
 | `candidate_writes_per_hour_global` | `200` | Candidate writes per hour across all agents. |
 | `search_default_results` | `5` | Results per search when the caller does not ask for more. |

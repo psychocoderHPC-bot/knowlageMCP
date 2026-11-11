@@ -240,7 +240,7 @@ class KnowledgeService:
         return self.identity.resolve_actor(token, actor_handle, connection_actors=connection_actors)
 
     def enforce_request_rate(self, session: SessionInfo) -> None:
-        """Consume one bounded per-session request token."""
+        """Consume one per-session and one process-wide request token."""
         self.identity.enforce_request_rate(session)
 
     def session_close(self, session: SessionInfo) -> dict[str, Any]:

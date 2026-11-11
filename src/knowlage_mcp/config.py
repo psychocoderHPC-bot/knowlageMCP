@@ -128,6 +128,9 @@ class LimitsConfig(_Section):
     registration_per_minute_global: int = 60
     requests_per_minute: int = 60
     request_burst: int = 20
+    #: Process-wide bound across all sessions. Admin socket calls do not use it.
+    requests_per_minute_global: int = 6000
+    request_burst_global: int = 1000
     candidate_writes_per_hour: int = 20
     candidate_writes_per_hour_global: int = 200
     search_default_results: int = 5
@@ -316,6 +319,8 @@ def validate_config(config: Config) -> list[str]:
         "registration_per_minute_global",
         "requests_per_minute",
         "request_burst",
+        "requests_per_minute_global",
+        "request_burst_global",
         "search_default_results",
         "search_max_results",
         "search_default_bytes",

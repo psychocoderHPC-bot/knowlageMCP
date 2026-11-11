@@ -73,6 +73,37 @@ def test_registration_global_rate_limit(tmp_path: Path) -> None:
         env.db.close()
 
 
+def test_global_request_rate_limit_spans_sessions(tmp_path: Path) -> None:
+    env = build_env(
+        tmp_path,
+        limits={
+            "requests_per_minute": 600,
+            "request_burst": 10,
+            "requests_per_minute_global": 60,
+            "request_burst_global": 4,
+        },
+    )
+    try:
+        first = env.session(env.register(label="first"))
+        second = env.session(env.register(label="second"))
+        # Four calls total, two per session, stay inside every bucket.
+        for _ in range(2):
+            env.service.enforce_request_rate(first)
+            env.service.enforce_request_rate(second)
+        # The fifth call exceeds the global burst while both sessions remain
+        # far below their own per-session limits.
+        with pytest.raises(ServiceError) as excinfo:
+            env.service.enforce_request_rate(first)
+        assert _code(excinfo) is ErrorCode.RATE_LIMITED
+        assert "global" in str(excinfo.value)
+        assert excinfo.value.retry_after_s is not None
+        # The bucket refills over time: two seconds restore two tokens.
+        env.monotonic.advance(2)
+        env.service.enforce_request_rate(first)
+    finally:
+        env.db.close()
+
+
 def test_max_sessions_fails_without_eviction(tmp_path: Path) -> None:
     env = build_env(tmp_path, identity={"max_sessions": 2})
     try:

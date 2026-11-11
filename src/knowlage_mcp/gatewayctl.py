@@ -187,6 +187,22 @@ def _print_smoke(status: dict[str, Any], smoke: dict[str, Any]) -> None:
     print("smoke test passed" if smoke.get("ok") else "smoke test failed")
 
 
+def _preview(value: Any, limit: int = 160) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _print_write_result(data: dict[str, Any]) -> None:
+    entry = data.get("entry", {})
+    print(f"{'entry_id':<18} {entry.get('entry_id', '-')}")
+    print(f"{'namespace':<18} {entry.get('namespace', '-')}")
+    print(f"{'lifecycle':<18} {entry.get('lifecycle', '-')}")
+    print(f"{'title':<18} {entry.get('title', '-')}")
+    print(f"{'claim':<18} {_preview(entry.get('claim', ''))}")
+
+
 def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "config":
         return _dispatch_config(args)
@@ -386,7 +402,10 @@ def _dispatch_memory(args: argparse.Namespace, client: AdminClient) -> int:
                 "title": args.title,
             },
         )
-        _emit(data, args.json)
+        if args.json:
+            _emit(data, True)
+        else:
+            _print_write_result(data)
         return 0
     if args.memory_command == "correct":
         text = _read_file(args.file)
@@ -398,7 +417,10 @@ def _dispatch_memory(args: argparse.Namespace, client: AdminClient) -> int:
                 "text": text,
             },
         )
-        _emit(data, args.json)
+        if args.json:
+            _emit(data, True)
+        else:
+            _print_write_result(data)
         return 0
     if args.memory_command == "retract":
         _emit(

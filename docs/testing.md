@@ -48,7 +48,9 @@ venv outside the tree.
   provenance lineage, duplicate behavior.
 - Retrieval: scope filtering, ranking fixtures, empty results, UTF-8-safe
   truncation, warning preservation.
-- Limits: rate and budget limiting with a fake clock; no real sleeps.
+- Limits: rate and budget limiting with a fake clock; no real sleeps. The
+  global request bound is covered by a unit test that advances an injectable
+  clock to prove refill over time.
 
 ## Integration layer
 
@@ -71,6 +73,9 @@ venv outside the tree.
   ledger, and index rebuild.
 - Optional backends disabled or unavailable still permit core reads and
   writes.
+- Concurrency: `tests/integration/test_concurrency.py` runs 50 concurrent
+  read/write clients and 50 concurrent readers, checks rate-limit rejection
+  with `Retry-After`, and verifies the second-writer lock.
 
 ## Security layer
 
@@ -118,9 +123,12 @@ budget per search):
 |---|---|---|
 | 1,000 entries, 10 clients | 9.4 ms | 46.8 ms |
 | 10,000 entries, 1 client | 13.0 ms | 28.9 ms |
+| 50 concurrent mixed clients, 1,000 calls | 168 ms | 375 ms |
+| 50 concurrent readers | 250 ms | 648 ms |
 | 10,000 entries, 10 clients | 22.0 ms | 181.6 ms |
 
-The 250 ms 10-client p95 target is met at both measured sizes. Timings are
+The 250 ms 10-client p95 target is met at both measured sizes. Server-side
+synchronous SQLite work dominates the concurrency timings. All timings are
 reported as information only; CI runs deterministic query-plan and
 bounded-work checks, not wall-clock gates.
 

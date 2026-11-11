@@ -209,6 +209,20 @@ knowlageMCP-gatewayctl index rebuild
 Rebuilds the FTS5 index from the canonical entries. Search indices are
 rebuildable; SQLite remains canonical.
 
+## Limits
+
+Rate and budget limits live in `[limits]` (see
+[configuration.md](configuration.md)). The service enforces a per-session
+request bucket and a process-wide bucket. Admin socket calls do not consume
+either request bucket, and registration has its own limiter.
+
+| Scope | Keys | Default |
+|---|---|---|
+| Per-session requests | `requests_per_minute`, `request_burst` | 60 per minute, burst 20 |
+| Global requests | `requests_per_minute_global`, `request_burst_global` | 6000 per minute, burst 1000 |
+| Registration | `registration_per_minute_per_source`, `registration_per_minute_global` | 10 per source, 60 globally |
+| Candidate writes | `candidate_writes_per_hour`, `candidate_writes_per_hour_global` | 20 per agent, 200 globally |
+
 ## Exit codes
 
 | Code | Meaning |

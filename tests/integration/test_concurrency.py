@@ -73,6 +73,8 @@ def _config(
             registration_per_minute_global=200,
             requests_per_minute=requests_per_minute,
             request_burst=request_burst,
+            requests_per_minute_global=100000,
+            request_burst_global=10000,
             candidate_writes_per_hour=1000,
             candidate_writes_per_hour_global=10000,
             evidence_object_bytes=1024,

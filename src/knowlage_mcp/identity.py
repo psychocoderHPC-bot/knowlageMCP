@@ -93,6 +93,7 @@ class IdentityManager:
         self._events = event_sink
         self._limiter = SlidingWindowLimiter(monotonic)
         self._request_limiter = TokenBucketLimiter(monotonic)
+        self._global_request_limiter = TokenBucketLimiter(monotonic)
 
     # -- helpers ---------------------------------------------------------
     def _now(self) -> datetime:
@@ -505,7 +506,7 @@ class IdentityManager:
         return session
 
     def enforce_request_rate(self, session: SessionInfo) -> None:
-        """Consume one per-session tool request token from ``[limits]``."""
+        """Consume one per-session and one process-wide tool request token."""
         limits = self.config.limits
         allowed, retry = self._request_limiter.allow(
             f"request:{session.session_id}",
@@ -516,6 +517,17 @@ class IdentityManager:
             raise ServiceError(
                 ErrorCode.RATE_LIMITED,
                 "per-session request rate limit exceeded",
+                retry_after_s=retry,
+            )
+        allowed, retry = self._global_request_limiter.allow(
+            "requests:global",
+            limits.requests_per_minute_global / 60.0,
+            float(limits.request_burst_global),
+        )
+        if not allowed:
+            raise ServiceError(
+                ErrorCode.RATE_LIMITED,
+                "global request rate limit exceeded",
                 retry_after_s=retry,
             )
 

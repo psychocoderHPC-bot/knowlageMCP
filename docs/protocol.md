@@ -89,6 +89,22 @@ returned.
 | `CONFLICT` | Generic state conflict (for example an already-decided enrollment) | Re-read state, do not retry unchanged |
 | `INTERNAL` | Unexpected server fault | Report; do not retry in a loop |
 
+### Argument validation and the envelope
+
+The MCP SDK validates tool arguments against each tool's JSON schema before the
+handler runs. Malformed arguments, including missing required fields, wrong
+types, and unknown properties, are rejected there and surface as an MCP tool
+error with `isError` set. They do not produce a `{"ok": ...}` envelope. The
+envelope applies to calls that pass schema validation and reach the service
+layer, where domain validation can still return `INVALID_ARGUMENT`.
+
+### Bounded search and context totals
+
+`search` and `get_context` gather at most 100 candidates before ranking and
+filtering. Their `total` value and `next_cursor` reflect that bounded candidate
+pool, not every database match. This is a bounded-work guard: narrow the query
+or add filters when you need coverage beyond the pool.
+
 ## HTTP bridge API
 
 The agent-facing HTTP surface. JSON bodies are capped at
