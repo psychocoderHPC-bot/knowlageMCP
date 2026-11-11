@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 René Widera
+# SPDX-License-Identifier: ISC
+#
+# knowlageMCP gateway as a systemd user service.
+#
+# Install:
+#   cp systemd/knowlage-mcp-gateway.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start knowlage-mcp-gateway
+#
+# The ExecStart path is the pipx shim for the console script. If you installed
+# elsewhere, point ExecStart at your knowlageMCP-gateway binary.
+#
+# Optional: keep the service running after you log out:
+#   loginctl enable-linger $USER
+# This unit does not enable linger automatically; it is an operator decision.
+#
+# The service starts without a mentor and without API keys.
+[Unit]
+Description=knowlageMCP knowledge gateway
+Documentation=https://github.com/psychocoderHPC-bot/knowlageMCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/knowlageMCP-gateway
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

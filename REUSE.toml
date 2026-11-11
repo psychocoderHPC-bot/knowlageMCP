@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 René Widera
+# SPDX-License-Identifier: ISC
+
+version = 1
+SPDX-PackageName = "knowlageMCP"
+SPDX-PackageSupplier = "René Widera <r.widera@hzdr.de>"
+SPDX-PackageDownloadLocation = "https://github.com/psychocoderHPC-bot/knowlageMCP"
+
+# License texts themselves cannot carry SPDX comment headers.
+[[annotations]]
+path = ["LICENSE", "LICENSES/ISC.txt"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 René Widera"
+SPDX-License-Identifier = "ISC"
+
+# JSON cannot carry SPDX comment headers; this annotation covers only the
+# versioned quality corpus, not every JSON file in the repository.
+[[annotations]]
+path = ["benchmarks/corpus_v1.json"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 René Widera"
+SPDX-License-Identifier = "ISC"

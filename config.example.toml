@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 René Widera
+# SPDX-License-Identifier: ISC
+#
+# knowlageMCP example configuration. Paths may use '~'; durations accept
+# integer seconds or strings such as 30s, 10m, 8h, 24h.
+
+# Network listener. Keep the bind address on loopback unless the deployment requires otherwise. direct_mcp_registration_token stays false unless a client-side handshake adapter needs it.
+[server]
+host = "127.0.0.1"
+port = 2230
+allowed_hosts = [
+    "127.0.0.1",
+    "localhost",
+    "host.containers.internal",
+]
+allowed_origins = []
+max_request_bytes = 131072
+direct_mcp_registration_token = false
+
+# Database, evidence objects, and backup snapshots. Backups do not protect against disk loss. runtime_socket defaults to $XDG_RUNTIME_DIR/knowlageMCP/admin.sock.
+[storage]
+database = "~/.local/share/knowlageMCP/knowledge.sqlite3"
+evidence_dir = "~/.local/share/knowlageMCP/evidence"
+backup_dir = "~/.local/share/knowlageMCP/backups"
+runtime_socket = "~/.local/state/knowlageMCP/admin.sock"
+evidence_quota_bytes = 1073741824
+database_soft_limit_bytes = 1073741824
+
+# Registration, session lifetimes (durations such as 8h), and namespace defaults.
+[identity]
+initial_namespace = "shared"
+personal_namespace = "personal"
+allow_self_registration = true
+session_idle_timeout = "8h"
+session_absolute_lifetime = "24h"
+mentor_request_lifetime = "10m"
+mentor_approved_lifetime = "2h"
+child_ticket_lifetime = "5m"
+max_sessions = 256
+
+# Hard request, search, and write budgets enforced by the service layer.
+[limits]
+registration_per_minute_per_source = 10
+registration_per_minute_global = 60
+requests_per_minute = 60
+request_burst = 20
+candidate_writes_per_hour = 20
+candidate_writes_per_hour_global = 200
+search_default_results = 5
+search_max_results = 10
+search_default_bytes = 4000
+search_max_bytes = 8000
+detail_page_bytes = 12000
+claim_body_bytes = 8192
+evidence_object_bytes = 262144
+
+# Review queue leases and per-session mentor budget.
+[review]
+lease_seconds = 600
+max_attempts = 3
+mentor_items_per_session = 20
+
+# Search backend selection for this release.
+[retrieval]
+include_candidates = true
+backend = "fts5"
+
+# Retention for scheduled online SQLite backups.
+[backup]
+daily = true
+keep_daily = 7
+keep_weekly = 4
+
+# Log verbosity. Logs never contain session tokens or evidence content.
+[logging]
+level = "INFO"
+
+# Optional integrations. All are off by default and never required for core use.
+[integrations]
+embeddings = false
+inference = false
+telemetry = false

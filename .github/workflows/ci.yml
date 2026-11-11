@@ -1,0 +1,152 @@
+# SPDX-FileCopyrightText: 2026 René Widera
+# SPDX-License-Identifier: ISC
+#
+# knowlageMCP continuous integration. No secrets, no model or API calls,
+# no PyPI publish.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: ruff (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff>=0.6"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  typecheck:
+    name: mypy (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: mypy
+        run: mypy src/knowlage_mcp
+
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Run unit, integration, and security tests
+        run: pytest
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install reuse
+        run: |
+          python -m pip install --upgrade pip
+          pip install "reuse[charset-normalizer]>=4.0"
+      - name: reuse lint
+        run: reuse lint
+
+  package:
+    name: Build and install wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install "build>=1.2"
+          python -m build
+      - name: Install wheel into a fresh venv outside the tree
+        working-directory: /tmp
+        run: |
+          python -m venv /tmp/kmcp-venv
+          /tmp/kmcp-venv/bin/pip install --upgrade pip
+          /tmp/kmcp-venv/bin/pip install /home/runner/work/knowlageMCP/knowlageMCP/dist/*.whl
+      - name: Verify packaged contents and console script
+        working-directory: /tmp
+        run: |
+          /tmp/kmcp-venv/bin/python - <<'PY'
+          import importlib.resources
+          import knowlage_mcp
+          import pathlib
+
+          assert knowlage_mcp.__version__ == "0.1.0"
+          assert knowlage_mcp.TOOL_NAMES and len(knowlage_mcp.TOOL_NAMES) == 15
+
+          skill = importlib.resources.files(knowlage_mcp).joinpath("resources", "SKILL.md")
+          assert skill.is_file(), "packaged SKILL.md is missing"
+          assert skill.read_text(encoding="utf-8").strip()
+          PY
+          /tmp/kmcp-venv/bin/knowlageMCP-gateway --help
+          /tmp/kmcp-venv/bin/knowlageMCP-gatewayctl --help
+          /tmp/kmcp-venv/bin/knowlageMCP-mcp --help
+
+  # Advisory only: pip-audit findings are evaluated per the security guidance
+  # in SECURITY.md rather than silently failing the build.
+  dependency-audit:
+    name: dependency audit (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pip-audit and the package
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+          pip install -e .
+      - name: pip-audit
+        run: pip-audit
