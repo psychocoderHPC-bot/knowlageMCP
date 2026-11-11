@@ -11,7 +11,8 @@ import httpx2
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from secutil import RunningGateway
+
+from conftest import RunningGateway
 
 pytestmark = pytest.mark.security
 

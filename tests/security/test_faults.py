@@ -15,7 +15,8 @@ from typing import Any
 
 import httpx2
 import pytest
-from secutil import (
+
+from conftest import (
     REPO_ROOT,
     CtlEnv,
     RunningGateway,
@@ -28,7 +29,6 @@ from secutil import (
     sqlite_one,
     wait_until,
 )
-
 from knowlage_mcp import evidence as evidence_module
 from knowlage_mcp.admin_client import AdminError
 from knowlage_mcp.config import Config, ServerConfig, StorageConfig, resolve_paths, write_config_atomic
@@ -77,6 +77,7 @@ def test_read_only_database_is_a_structured_storage_error(tmp_path: Path) -> Non
             )
         assert error.value.code is ErrorCode.STORAGE_FULL
         assert count_rows(config.storage.database, "entries") == 0
+        assert database.integrity_check() == "ok"
     finally:
         database.close()
 

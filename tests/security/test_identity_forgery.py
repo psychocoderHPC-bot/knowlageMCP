@@ -10,8 +10,8 @@ import httpx2
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from secutil import RunningGateway, auth, register
 
+from conftest import RunningGateway, auth, register
 from knowlage_mcp.bridge import BridgeBackend
 
 pytestmark = pytest.mark.security

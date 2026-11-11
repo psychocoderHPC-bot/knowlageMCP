@@ -86,3 +86,21 @@ Commands:
 knowlageMCP-gatewayctl export --namespace shared --output knowledge.jsonl
 knowlageMCP-gatewayctl import knowledge.jsonl --dry-run
 ```
+
+## Dependency licenses
+
+Runtime dependencies only: `mcp` (MIT), `fastapi` (MIT), `uvicorn`
+(BSD-3-Clause), `httpx` (BSD-3-Clause), `httpx2` (BSD-3-Clause), `pydantic`
+(MIT), `platformdirs` (MIT), `tomli-w` (MIT). All are permissive and
+redistributable with this project's ISC license; there is no copyleft runtime
+dependency.
+
+Development-only tools include `reuse` (GPL-3.0-or-later and other licenses)
+and its transitive `python-debian` (GPL-2.0-or-later). They are not imported,
+bundled, or redistributed by the built wheel/sdist as runtime code; they run
+only in CI/development. GPL dev tools do not change the license of this
+project's code but must not be vendored into it.
+
+`reuse lint` proves SPDX/REUSE compliance of this repository's files and does
+not by itself establish redistribution compatibility of third-party packages.
+Run a license audit when adding a dependency.

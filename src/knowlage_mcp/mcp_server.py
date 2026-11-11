@@ -286,7 +286,9 @@ def _token_from_context(ctx: Context[Any, Any]) -> str | None:
 
 
 def _resolve(service: KnowledgeService, token: str | None, actor_handle: str | None) -> SessionInfo:
-    return service.resolve_actor(token, actor_handle)
+    session = service.resolve_actor(token, actor_handle)
+    service.enforce_request_rate(session)
+    return session
 
 
 def _register_data(service: KnowledgeService, args: RegisterToolArgs) -> dict[str, Any]:

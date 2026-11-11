@@ -36,6 +36,11 @@ from .policy import PERSONAL_KIND, namespace_kind, now_from, readable_namespaces
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _QUOTED_RE = re.compile(r'"([^"]+)"')
 _MAX_LIKE_TERMS = 16
+#: Bound the candidate pool fed to ranking. Ranking is cheap over a few dozen
+#: rows; the expensive part is materializing every FTS/LIKE match first.
+_MAX_CANDIDATE_POOL = 100
+#: Keep provenance lookups under SQLite's default parameter limit.
+_CONTRADICTION_CHUNK = 400
 
 _LIFECYCLE_RANK = {
     Lifecycle.PUBLISHED: 0,
@@ -165,7 +170,14 @@ class RetrievalManager:
         query: str,
         *,
         exact_phrase: bool,
+        limit: int,
     ) -> dict[str, dict[str, Any]]:
+        """Return a bounded candidate pool, ACL-filtered by namespace already.
+
+        FTS rows arrive best-bm25-first so the cap keeps the most relevant
+        lexical matches. LIKE is only a fallback for tokens that FTS tokenizes
+        poorly (long identifiers and punctuation) and is capped the same way.
+        """
         if not namespaces:
             return {}
         placeholders = ",".join("?" for _ in namespaces)
@@ -184,14 +196,17 @@ class RetrievalManager:
                     JOIN entry_revisions r ON r.revision_id = entry_fts.revision_id
                     JOIN entries e ON e.current_revision_id = r.revision_id
                     WHERE entry_fts MATCH ? AND e.namespace IN ({placeholders})
+                    ORDER BY bm25(entry_fts)
+                    LIMIT ?
                     """,
-                    (match, *namespaces),
+                    (match, *namespaces, limit),
                 ).fetchall()
             except sqlite3.OperationalError as exc:
                 raise ServiceError(ErrorCode.INVALID_ARGUMENT, "search query is not valid") from exc
             for row in rows:
-                candidate = _row_to_candidate(row)
-                candidates[candidate["entry_id"]] = candidate
+                entry_id = str(row["entry_id"])
+                if entry_id not in candidates:
+                    candidates[entry_id] = _row_to_candidate(row)
 
         stripped = " ".join(query.split())
         if stripped:
@@ -217,12 +232,16 @@ class RetrievalManager:
                 FROM entries e
                 JOIN entry_revisions r ON r.revision_id = e.current_revision_id
                 WHERE e.namespace IN ({placeholders}) AND ({conditions})
+                ORDER BY r.created_at DESC
+                LIMIT ?
                 """,
-                (*namespaces, *params),
+                (*namespaces, *params, limit),
             ).fetchall()
             for row in rows:
-                candidate = _row_to_candidate(row)
-                candidates.setdefault(candidate["entry_id"], candidate)
+                entry_id = str(row["entry_id"])
+                # FTS already supplied a scored row for this entry.
+                if entry_id not in candidates:
+                    candidates[entry_id] = _row_to_candidate(row)
 
         if not stripped:
             rows = conn.execute(
@@ -235,13 +254,14 @@ class RetrievalManager:
                 JOIN entry_revisions r ON r.revision_id = e.current_revision_id
                 WHERE e.namespace IN ({placeholders})
                 ORDER BY r.created_at DESC
-                LIMIT 200
+                LIMIT ?
                 """,
-                tuple(namespaces),
+                (*namespaces, limit),
             ).fetchall()
             for row in rows:
-                candidate = _row_to_candidate(row)
-                candidates.setdefault(candidate["entry_id"], candidate)
+                entry_id = str(row["entry_id"])
+                if entry_id not in candidates:
+                    candidates[entry_id] = _row_to_candidate(row)
         return candidates
 
     # -- ranking ---------------------------------------------------------
@@ -256,8 +276,26 @@ class RetrievalManager:
             candidate_strength = _EVIDENCE_STRENGTH[candidate["evidence_class"]]
             if candidate_strength < _EVIDENCE_STRENGTH[filters.evidence_class]:
                 return False
-        scope_ok = filters.scope.is_empty() or candidate["scope"].satisfies(filters.scope)
-        return scope_ok
+        return True
+
+    @staticmethod
+    def _applicability(candidate_scope: Scope, query_scope: Scope) -> int:
+        """Scope applicability against the query, never against field count.
+
+        0: the query is unconstrained, or the entry scope satisfies it.
+        1: the entry leaves a required dimension unknown.
+        2: the entry names a different value for a required dimension.
+
+        Ranking never treats an unknown scope as universal applicability.
+        Compatibility is enforced before ranking (see :meth:`_rank`), so only
+        bucket 0 reaches the sort today; the buckets stay explicit so the
+        ordering cannot silently drift back to a scope-field count.
+        """
+        if query_scope.is_empty() or candidate_scope.satisfies(query_scope):
+            return 0
+        if candidate_scope.is_empty():
+            return 1
+        return 2
 
     @staticmethod
     def _lifecycle_allowed(filters: SearchFilters, include_candidates: bool) -> set[Lifecycle]:
@@ -268,26 +306,38 @@ class RetrievalManager:
             allowed.add(Lifecycle.CANDIDATE)
         return allowed
 
-    def _contradictions(self, revision_id: str) -> tuple[str, ...]:
-        rows = (
-            self.db.connect()
-            .execute(
-                "SELECT from_revision_id, to_revision_id FROM provenance_edges "
-                "WHERE relation = 'contradicts' AND (from_revision_id = ? OR to_revision_id = ?)",
-                (revision_id, revision_id),
-            )
-            .fetchall()
-        )
-        found: list[str] = []
-        for row in rows:
-            other = (
-                str(row["to_revision_id"])
-                if str(row["from_revision_id"]) == revision_id
-                else str(row["from_revision_id"])
-            )
-            if other != revision_id and other not in found:
-                found.append(other)
-        return tuple(found)
+    def _contradictions_for(self, revision_ids: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        """Batch provenance lookups for every candidate revision.
+
+        One query covers the normal candidate pool; larger pools are split only
+        to stay under SQLite's default bound-parameter limit.
+        """
+        unique = list(dict.fromkeys(revision_ids))
+        found: dict[str, list[str]] = {revision_id: [] for revision_id in unique}
+        if not unique:
+            return {}
+        conn = self.db.connect()
+        for start in range(0, len(unique), _CONTRADICTION_CHUNK):
+            chunk = unique[start : start + _CONTRADICTION_CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT from_revision_id, to_revision_id FROM provenance_edges
+                WHERE relation = 'contradicts'
+                  AND (from_revision_id IN ({placeholders}) OR to_revision_id IN ({placeholders}))
+                """,
+                (*chunk, *chunk),
+            ).fetchall()
+            for row in rows:
+                left = str(row["from_revision_id"])
+                right = str(row["to_revision_id"])
+                if left == right:
+                    continue
+                if left in found and right not in found[left]:
+                    found[left].append(right)
+                if right in found and left not in found[right]:
+                    found[right].append(left)
+        return {revision_id: tuple(others) for revision_id, others in found.items()}
 
     def _rank(
         self,
@@ -297,14 +347,30 @@ class RetrievalManager:
     ) -> list[SearchResult]:
         candidate_list = list(candidates)
         allowed = self._lifecycle_allowed(filters, include_candidates)
-        results: list[SearchResult] = []
+        compatible: list[tuple[dict[str, Any], int]] = []
         for candidate in candidate_list:
             lifecycle = candidate["lifecycle"]
             if lifecycle not in allowed:
                 continue
             if not self._passes_filters(candidate, filters):
                 continue
-            contradictions = self._contradictions(candidate["revision_id"])
+            bucket = self._applicability(candidate["scope"], filters.scope)
+            if bucket != 0:
+                # Unknown (1) or conflicting (2) scopes are excluded before
+                # ranking: an unconstrained entry is not universally applicable
+                # to a query that names a scope dimension.
+                continue
+            compatible.append((candidate, bucket))
+
+        contradictions_by_revision = self._contradictions_for(
+            candidate["revision_id"] for candidate, _ in compatible
+        )
+        by_entry: dict[str, dict[str, Any]] = {}
+        applicability: dict[str, int] = {}
+        results: list[SearchResult] = []
+        for candidate, bucket in compatible:
+            lifecycle = candidate["lifecycle"]
+            contradictions = contradictions_by_revision.get(candidate["revision_id"], ())
             warnings: list[str] = []
             if contradictions:
                 warnings.extend(f"contradicts revision {other}" for other in contradictions)
@@ -312,6 +378,8 @@ class RetrievalManager:
                 warnings.append("disputed: credible conflicting evidence exists")
             if lifecycle == Lifecycle.CANDIDATE:
                 warnings.append("low trust: candidate has not been reviewed")
+            by_entry[candidate["entry_id"]] = candidate
+            applicability[candidate["entry_id"]] = bucket
             results.append(
                 SearchResult(
                     entry_id=candidate["entry_id"],
@@ -332,14 +400,17 @@ class RetrievalManager:
                 )
             )
 
-        # bm25 is not stored on the result; recover it from the candidate score.
-        by_entry = {candidate["entry_id"]: candidate for candidate in candidate_list}
+        def bm25_key(entry_id: str) -> float:
+            # bm25() is lower-is-better (negative); LIKE-only rows sort last.
+            rank = by_entry[entry_id]["rank"]
+            return float(rank) if rank is not None else float("inf")
+
         results.sort(
             key=lambda item: (
                 _LIFECYCLE_RANK.get(item.lifecycle, 9),
-                -sum(1 for value in item.scope.model_dump().values() if value is not None),
+                applicability[item.entry_id],
+                bm25_key(item.entry_id),
                 -_EVIDENCE_STRENGTH[item.evidence_class],
-                (by_entry[item.entry_id]["rank"] if by_entry[item.entry_id]["rank"] is not None else 0.0),
                 -(item.updated_at.timestamp() if item.updated_at is not None else 0.0),
             )
         )
@@ -379,9 +450,6 @@ class RetrievalManager:
         cursor: str | None,
         include_candidates: bool,
     ) -> SearchResponse:
-        candidates = self._fetch_candidates(namespaces, query, exact_phrase=filters.exact_phrase)
-        ranked = self._rank(candidates.values(), filters, include_candidates)
-        total = len(ranked)
         query_hash = hashlib.sha256(
             json.dumps(
                 {
@@ -395,6 +463,20 @@ class RetrievalManager:
             ).encode()
         ).hexdigest()
         offset = _cursor_decode(cursor, query_hash) if cursor else 0
+        # Bounded over-fetch: rank a small multiple of the requested window,
+        # never unbounded, so the N+1-free ranking stays cheap on large corpora.
+        candidate_limit = min(
+            _MAX_CANDIDATE_POOL,
+            max(max_results * 4, offset + max_results),
+        )
+        candidates = self._fetch_candidates(
+            namespaces,
+            query,
+            exact_phrase=filters.exact_phrase,
+            limit=candidate_limit,
+        )
+        ranked = self._rank(candidates.values(), filters, include_candidates)
+        total = len(ranked)
         if offset > total:
             offset = total
         window = ranked[offset : offset + max_results]

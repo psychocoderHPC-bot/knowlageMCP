@@ -15,7 +15,10 @@ import importlib.resources
 import json
 import os
 import queue
+import shutil
+import socket
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -28,6 +31,7 @@ from . import PROTOCOL_VERSION, SKILL_RESOURCE_NAME, SKILL_RESOURCE_URI, TOOL_NA
 from .backup import BackupManager
 from .config import (
     Config,
+    config_dir,
     diff_keys,
     load_config,
     parse_duration,
@@ -68,6 +72,13 @@ from .models import (
 from .policy import audit, namespace_kind, now_from, require_namespace
 from .retrieval import RetrievalManager
 from .review import ReviewManager
+
+#: Doctor thresholds. A warning is informational for operators, never a gate.
+DOCTOR_MIN_FREE_BYTES = 1024**3
+DOCTOR_MIN_FREE_FRACTION = 0.05
+DOCTOR_PROBE_TIMEOUT_S = 0.25
+CONTAINER_HOST = "host.containers.internal"
+TEROK_SHIELD_HINT = "the terok Shield grant localhost:2230 may require task recreation after a network change"
 
 
 class _DryRunRollback(Exception):
@@ -124,10 +135,12 @@ class KnowledgeService:
         *,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        config_path: Path | str | None = None,
     ) -> None:
         self.config = config
         self.db = db
         self.evidence = evidence
+        self._config_path = Path(config_path) if config_path is not None else None
         self._clock = clock
         self._monotonic = monotonic
         self._started = monotonic()
@@ -225,6 +238,10 @@ class KnowledgeService:
         connection_actors: Iterable[str] | None = None,
     ) -> SessionInfo:
         return self.identity.resolve_actor(token, actor_handle, connection_actors=connection_actors)
+
+    def enforce_request_rate(self, session: SessionInfo) -> None:
+        """Consume one bounded per-session request token."""
+        self.identity.enforce_request_rate(session)
 
     def session_close(self, session: SessionInfo) -> dict[str, Any]:
         return self.identity.session_close(session)
@@ -357,6 +374,7 @@ class KnowledgeService:
         }
 
     def doctor(self) -> dict[str, Any]:
+        """Run the documented diagnostics surface without leaking secrets."""
         checks: list[dict[str, Any]] = []
 
         def add(name: str, ok: bool, detail: str = "") -> None:
@@ -364,33 +382,109 @@ class KnowledgeService:
 
         problems = validate_config(self.config)
         add("config", not problems, "; ".join(problems) if problems else "valid")
+
+        config_file = self._config_path or (config_dir() / "config.toml")
+        try:
+            if config_file.exists():
+                mode = stat.S_IMODE(config_file.stat().st_mode)
+                add(
+                    "config_file",
+                    mode == 0o600,
+                    f"{config_file} mode {mode:04o}" + ("" if mode == 0o600 else " (expected 0600)"),
+                )
+            else:
+                add("config_file", True, f"{config_file} not present (built-in defaults)")
+        except OSError as exc:
+            add("config_file", False, f"{config_file}: {exc}")
+
+        directories = (
+            ("data_dir", Path(self.db.path).parent),
+            ("evidence_dir", Path(self.config.storage.evidence_dir)),
+            ("backup_dir", Path(self.config.storage.backup_dir)),
+        )
+        for name, directory in directories:
+            try:
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                mode = stat.S_IMODE(directory.stat().st_mode)
+                probe = directory / ".doctor-probe"
+                probe.write_text("ok", encoding="utf-8")
+                probe.unlink()
+                ok = mode == 0o700
+                add(name, ok, f"{directory} mode {mode:04o}" + ("" if ok else " (expected 0700)"))
+            except OSError as exc:
+                add(name, False, f"{directory}: {exc}")
+
         try:
             conn = self.db.connect()
             add("database", True, str(self.db.path))
-            add("schema_version", self.db.schema_version() == MAX_VERSION, str(self.db.schema_version()))
-            add("integrity", self.db.integrity_check() == "ok", self.db.integrity_check())
+            version = self.db.schema_version()
+            add("schema_version", version == MAX_VERSION, f"{version} (expected {MAX_VERSION})")
+            # One integrity pass only; it is the most expensive pragma here.
+            integrity = self.db.integrity_check()
+            add("integrity", integrity == "ok", integrity)
             fts_rows = conn.execute("SELECT COUNT(*) FROM entry_fts").fetchone()
             add("fts5", fts_rows is not None, "entry_fts queryable")
             fk = conn.execute("PRAGMA foreign_key_check").fetchall()
             add("foreign_keys", not fk, f"{len(fk)} violations")
         except (sqlite3.DatabaseError, OSError) as exc:
             add("database", False, str(exc))
+
         try:
-            evidence_root = Path(self.config.storage.evidence_dir)
-            evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            probe = evidence_root / ".doctor-probe"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink()
-            add("evidence_dir", True, str(evidence_root))
+            usage = shutil.disk_usage(Path(self.db.path).parent)
+            fraction = (usage.free / usage.total) if usage.total else 0.0
+            free_ok = usage.free >= DOCTOR_MIN_FREE_BYTES and fraction >= DOCTOR_MIN_FREE_FRACTION
+            add(
+                "free_space",
+                free_ok,
+                f"{usage.free / 1024**3:.2f} GiB free ({fraction * 100:.1f}%); warn under 1 GiB or 5%",
+            )
         except OSError as exc:
-            add("evidence_dir", False, str(exc))
+            add("free_space", False, str(exc))
+
+        host = self.config.server.host
+        port = self.config.server.port
+        probe_host = host
+        if host in {"", "0.0.0.0"}:
+            probe_host = "127.0.0.1"
+        elif host == "::":
+            probe_host = "::1"
         try:
-            backup_root = Path(self.config.storage.backup_dir)
-            backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            add("backup_dir", True, str(backup_root))
+            with socket.create_connection((probe_host, port), timeout=DOCTOR_PROBE_TIMEOUT_S):
+                add("listener", True, f"accepting connections at {host}:{port}")
         except OSError as exc:
-            add("backup_dir", False, str(exc))
-        add("listener", True, f"{self.config.server.host}:{self.config.server.port}")
+            add("listener", False, f"{host}:{port} not accepting connections ({exc})")
+
+        socket_path = Path(self.config.storage.runtime_socket)
+        try:
+            status = socket_path.stat()
+            mode = stat.S_IMODE(status.st_mode)
+            ok = stat.S_ISSOCK(status.st_mode) and mode == 0o600 and status.st_uid == os.geteuid()
+            add(
+                "admin_socket",
+                ok,
+                f"{socket_path} mode {mode:04o} owner {status.st_uid}",
+            )
+        except FileNotFoundError:
+            add("admin_socket", False, f"{socket_path} not present")
+        except OSError as exc:
+            add("admin_socket", False, f"{socket_path}: {exc}")
+
+        configured_container = host == CONTAINER_HOST or CONTAINER_HOST in self.config.server.allowed_hosts
+        if not configured_container:
+            add("container_reachability", True, f"{CONTAINER_HOST} not configured; {TEROK_SHIELD_HINT}")
+        else:
+            try:
+                socket.getaddrinfo(CONTAINER_HOST, None)
+                add("container_reachability", True, f"{CONTAINER_HOST} resolves; {TEROK_SHIELD_HINT}")
+            except OSError as exc:
+                # A bind-only target is a client-side hint, not a host failure.
+                required = host == CONTAINER_HOST
+                add(
+                    "container_reachability",
+                    not required,
+                    f"{CONTAINER_HOST} not resolvable ({exc}); {TEROK_SHIELD_HINT}",
+                )
+
         return {"ok": all(check["ok"] for check in checks), "checks": checks}
 
     def list_agents(self) -> list[dict[str, Any]]:

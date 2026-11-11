@@ -10,8 +10,8 @@ from typing import Any
 
 import httpx2
 import pytest
-from secutil import RunningGateway, auth, record, register
 
+from conftest import RunningGateway, auth, record, register
 from knowlage_mcp.mcp_server import ALL_TOOL_NAMES
 
 pytestmark = pytest.mark.security

@@ -8,7 +8,8 @@ from typing import Any
 
 import httpx2
 import pytest
-from secutil import RunningGateway, auth, record, register
+
+from conftest import RunningGateway, auth, record, register
 
 pytestmark = pytest.mark.security
 

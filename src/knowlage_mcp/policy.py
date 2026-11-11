@@ -299,11 +299,47 @@ class SlidingWindowLimiter:
             self._hits.clear()
 
 
+class TokenBucketLimiter:
+    """Bounded in-memory token bucket with an injectable monotonic clock.
+
+    ``burst`` tokens are available immediately; ``rate_per_second`` tokens are
+    restored continuously. The state is process local, like the registration
+    window, and entries older than an hour are pruned once the map grows past a
+    small bound.
+    """
+
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._now = monotonic
+        self._state: dict[str, tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, rate_per_second: float, burst: float) -> tuple[bool, int]:
+        """Consume one token; return ``(allowed, retry_after_seconds)``."""
+        if rate_per_second <= 0 or burst <= 0:
+            return True, 0
+        now = float(self._now())
+        capacity = float(burst)
+        with self._lock:
+            tokens, last = self._state.get(key, (capacity, now))
+            if now > last:
+                tokens = min(capacity, tokens + (now - last) * rate_per_second)
+            if tokens >= 1.0:
+                self._state[key] = (tokens - 1.0, now)
+                return True, 0
+            retry = max(1, math.ceil((1.0 - tokens) / rate_per_second))
+            self._state[key] = (tokens, now)
+            if len(self._state) > 4096:
+                cutoff = now - 3600.0
+                self._state = {name: value for name, value in self._state.items() if value[1] >= cutoff}
+            return False, retry
+
+
 __all__ = [
     "DEFAULT_ROOT_ROLES",
     "PERSONAL_KIND",
     "ROLE_RANK",
     "SlidingWindowLimiter",
+    "TokenBucketLimiter",
     "audit",
     "can_mentor",
     "can_read",

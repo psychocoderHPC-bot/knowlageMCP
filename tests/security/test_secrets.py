@@ -13,7 +13,8 @@ import httpx2
 import pytest
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from secutil import CtlEnv, RunningGateway, auth, record, register
+
+from conftest import CtlEnv, RunningGateway, auth, record, register
 
 pytestmark = pytest.mark.security
 

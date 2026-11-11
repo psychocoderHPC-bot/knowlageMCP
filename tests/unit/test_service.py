@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 from pathlib import Path
 
@@ -33,7 +34,43 @@ def _record(env: ServiceEnv, claim: str, *, title: str = "service note", evidenc
     )
 
 
-def test_status_protocol_and_doctor(env: ServiceEnv) -> None:
+def _listening_socket() -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    return listener
+
+
+def _closed_port() -> int:
+    probe = _listening_socket()
+    try:
+        return int(probe.getsockname()[1])
+    finally:
+        probe.close()
+
+
+def _admin_socket(path: Path) -> socket.socket:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix.bind(str(path))
+    path.chmod(0o600)
+    return unix
+
+
+def _config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: int) -> Path:
+    config_home = tmp_path / "config-home"
+    app_dir = config_home / "knowlageMCP"
+    app_dir.mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    config_file = app_dir / "config.toml"
+    config_file.write_text("", encoding="utf-8")
+    config_file.chmod(mode)
+    return config_file
+
+
+def test_status_protocol_and_doctor(env: ServiceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = env.service.get_protocol_info()
     assert info.schema_version >= 1
     assert "search" in info.tool_names
@@ -44,10 +81,56 @@ def test_status_protocol_and_doctor(env: ServiceEnv) -> None:
     assert status["namespaces"] == 2
     assert status["uptime_s"] >= 0
 
-    doctor = env.service.doctor()
-    assert doctor["ok"] is True
+    _config_file(tmp_path, monkeypatch, 0o600)
+    listener = _listening_socket()
+    admin_path = tmp_path / "runtime" / "admin.sock"
+    unix = _admin_socket(admin_path)
+    env.service.config.server.port = int(listener.getsockname()[1])
+    env.service.config.storage.runtime_socket = admin_path
+    try:
+        doctor = env.service.doctor()
+    finally:
+        unix.close()
+        admin_path.unlink(missing_ok=True)
+        listener.close()
+
+    assert doctor["ok"] is True, doctor
     names = {check["name"] for check in doctor["checks"]}
-    assert {"config", "database", "fts5", "integrity"} <= names
+    assert {
+        "config",
+        "config_file",
+        "data_dir",
+        "evidence_dir",
+        "backup_dir",
+        "database",
+        "schema_version",
+        "integrity",
+        "fts5",
+        "foreign_keys",
+        "free_space",
+        "listener",
+        "admin_socket",
+        "container_reachability",
+    } <= names
+
+
+def test_doctor_reports_config_mode_and_missing_runtime_assets(
+    env: ServiceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_file = _config_file(tmp_path, monkeypatch, 0o644)
+    env.service.config.server.port = _closed_port()
+    env.service.config.storage.runtime_socket = tmp_path / "runtime" / "admin.sock"
+
+    doctor = env.service.doctor()
+    by_name = {check["name"]: check for check in doctor["checks"]}
+    assert doctor["ok"] is False
+    assert by_name["config_file"]["ok"] is False
+    assert by_name["listener"]["ok"] is False
+    assert by_name["admin_socket"]["ok"] is False
+
+    config_file.chmod(0o600)
+    refreshed = {check["name"]: check for check in env.service.doctor()["checks"]}
+    assert refreshed["config_file"]["ok"] is True
 
 
 def test_event_bus_publishes_registration_events(env: ServiceEnv) -> None:

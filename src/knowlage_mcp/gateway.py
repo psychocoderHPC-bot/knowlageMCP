@@ -250,6 +250,19 @@ class RequestContextMiddleware:
             )
 
 
+#: JSON-RPC framing overhead allowed above the evidence object budget on /mcp.
+#: The upload_evidence handler still enforces the exact object limit; this only
+#: keeps the envelope from winning the race against the tool-level check.
+MCP_ENVELOPE_HEADROOM_BYTES = 64 * 1024
+
+
+def _mcp_request_limit(config: Config) -> int:
+    return max(
+        config.server.max_request_bytes,
+        config.limits.evidence_object_bytes + MCP_ENVELOPE_HEADROOM_BYTES,
+    )
+
+
 class BodyLimitMiddleware:
     """Enforce request byte caps before buffering the whole body.
 
@@ -265,19 +278,28 @@ class BodyLimitMiddleware:
         max_bytes: int,
         evidence_max_bytes: int | None = None,
         evidence_path: str = ROUTE_EVIDENCE,
+        mcp_path: str = "/mcp",
+        mcp_max_bytes: int | None = None,
     ) -> None:
         self.app = app
         self.max_bytes = max(1, int(max_bytes))
         self.evidence_max_bytes = max(1, int(evidence_max_bytes)) if evidence_max_bytes else None
         self.evidence_path = evidence_path
+        self.mcp_path = mcp_path
+        self.mcp_max_bytes = max(1, int(mcp_max_bytes)) if mcp_max_bytes else None
 
     def _limit_for(self, scope: Scope) -> int:
-        if (
-            self.evidence_max_bytes is not None
-            and scope.get("method") == "POST"
-            and scope.get("path") == self.evidence_path
-        ):
+        if self.evidence_max_bytes is None or scope.get("method") != "POST":
+            return self.max_bytes
+        path = scope.get("path")
+        if path == self.evidence_path:
+            # Raw evidence has its own object budget, independent of the JSON cap.
             return self.evidence_max_bytes
+        if path == self.mcp_path:
+            # The MCP JSON-RPC envelope can carry an upload_evidence payload.
+            # The tool itself enforces evidence_object_bytes, so the transport
+            # allows bounded framing overhead and reports the tool's own error.
+            return self.mcp_max_bytes or max(self.max_bytes, self.evidence_max_bytes)
         return self.max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -480,7 +502,10 @@ def create_app(config: Config, service: KnowledgeService) -> FastAPI:
     mcp = build_mcp_server(config, service)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
-        max_request_body_size=config.server.max_request_bytes,
+        # upload_evidence travels inside the JSON-RPC envelope; allow the
+        # evidence object budget through the MCP transport as well. The tool
+        # handler still enforces evidence_object_bytes on the decoded text.
+        max_request_body_size=_mcp_request_limit(config),
         transport_security=_mcp_transport_security(config),
         host=config.server.host,
     )
@@ -657,6 +682,7 @@ def create_app(config: Config, service: KnowledgeService) -> FastAPI:
         BodyLimitMiddleware,
         max_bytes=config.server.max_request_bytes,
         evidence_max_bytes=config.limits.evidence_object_bytes,
+        mcp_max_bytes=_mcp_request_limit(config),
     )
     app.add_middleware(RequestContextMiddleware)
     return app
@@ -703,14 +729,14 @@ def _lock_path(config: Config) -> Path:
     return database.parent / f"{database.name}.lock"
 
 
-async def _serve(config: Config) -> int:
+async def _serve(config: Config, config_path: Path | None = None) -> int:
     db = Database(config.storage.database)
     evidence = EvidenceStore(
         config.storage.evidence_dir,
         quota_bytes=config.storage.evidence_quota_bytes,
         max_object_bytes=config.limits.evidence_object_bytes,
     )
-    service = KnowledgeService(config, db, evidence)
+    service = KnowledgeService(config, db, evidence, config_path=config_path)
     try:
         service.bootstrap()
     except Exception:
@@ -762,7 +788,7 @@ async def _serve(config: Config) -> int:
             db.close()
 
 
-def run_gateway(config: Config) -> int:
+def run_gateway(config: Config, config_path: Path | None = None) -> int:
     """Run the gateway in the foreground; returns a process exit code."""
     _configure_logging(config)
     problems = validate_config(config)
@@ -772,7 +798,7 @@ def run_gateway(config: Config) -> int:
         return 1
     try:
         with lock_file(_lock_path(config)):
-            return asyncio.run(_serve(config))
+            return asyncio.run(_serve(config, config_path))
     except DatabaseLockedError as exc:
         logger.error("%s", exc)
         return 3
@@ -787,7 +813,7 @@ def run_gateway_from_path(path: str | None = None) -> int:
     except (FileNotFoundError, ValueError) as exc:
         logger.error("config could not be loaded: %s", exc)
         return 1
-    return run_gateway(config)
+    return run_gateway(config, Path(path) if path else None)
 
 
 __all__ = [

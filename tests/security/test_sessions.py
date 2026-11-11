@@ -8,7 +8,8 @@ import json
 
 import httpx2
 import pytest
-from secutil import CtlEnv, RunningGateway, auth, register, sqlite_exec
+
+from conftest import CtlEnv, RunningGateway, auth, register, sqlite_exec
 
 pytestmark = pytest.mark.security
 

@@ -9,7 +9,7 @@ from typing import Any
 import httpx2
 import pytest
 
-from conftest import RunningGateway
+from conftest import RunningGateway, free_port
 
 pytestmark = pytest.mark.integration
 
@@ -197,3 +197,42 @@ def test_evidence_upload_download_and_cap(gateway_server: RunningGateway) -> Non
 
         unauthenticated = client.get(f"/v1/bridge/evidence/{record['evidence_id']}")
         assert unauthenticated.status_code == 401
+
+
+def test_evidence_cap_is_object_limit_not_generic_json_limit(
+    gateway_factory: Any, tmp_path: Any, short_runtime_dir: Any
+) -> None:
+    from knowlage_mcp.config import Config, ServerConfig, StorageConfig, resolve_paths
+
+    data = tmp_path / "evidence-cap-data"
+    config = resolve_paths(
+        Config(
+            server=ServerConfig(
+                host="127.0.0.1",
+                port=free_port(),
+                allowed_hosts=["127.0.0.1", "localhost"],
+                max_request_bytes=131072,
+            ),
+            storage=StorageConfig(
+                database=data / "knowledge.sqlite3",
+                evidence_dir=data / "evidence",
+                backup_dir=data / "backups",
+                runtime_socket=short_runtime_dir / "admin.sock",
+            ),
+        )
+    )
+    running = gateway_factory(config)
+    # Avoid a long unbroken base64-like run: the store legitimately redacts it.
+    payload = (b"evidence payload line alpha beta\n" * 7000)[: 200 * 1024]
+    with httpx2.Client(base_url=running.base_url) as client:
+        token = _register(client)["session_token"]
+        headers = {**_auth(token), "Content-Type": "text/plain"}
+        accepted = client.post("/v1/bridge/evidence", content=payload, headers=headers)
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["size_bytes"] == len(payload)
+
+        object_cap = running.config.limits.evidence_object_bytes
+        assert object_cap > running.config.server.max_request_bytes
+        over = client.post("/v1/bridge/evidence", content=b"x" * (object_cap + 1), headers=headers)
+        assert over.status_code == 413, over.text
+        assert over.json()["error"]["code"] == "BUDGET_EXCEEDED"

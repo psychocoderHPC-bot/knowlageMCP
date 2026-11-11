@@ -8,7 +8,8 @@ from typing import Any
 
 import httpx2
 import pytest
-from secutil import RunningGateway, auth, record, register, sqlite_exec, sqlite_one
+
+from conftest import RunningGateway, auth, record, register, sqlite_exec, sqlite_one
 
 pytestmark = pytest.mark.security
 
@@ -156,7 +157,7 @@ def test_mentor_cannot_review_own_contributed_revision(gateway_server: RunningGa
         )
         entry_id = data["entry"]["entry_id"]
         revision_id = data["entry"]["revision_id"]
-        job = sqlist_job(database, revision_id)
+        job = _job_id(database, revision_id)
         sqlite_exec(
             database,
             "UPDATE review_jobs SET state = 'leased', lease_owner = ?, lease_id = ?, "
@@ -183,7 +184,7 @@ def test_mentor_cannot_review_own_contributed_revision(gateway_server: RunningGa
     assert detail.json()["data"]["lifecycle"] == "candidate"
 
 
-def sqlist_job(database: Any, revision_id: str) -> str:
+def _job_id(database: Any, revision_id: str) -> str:
     row = sqlite_one(database, "SELECT job_id FROM review_jobs WHERE revision_id = ?", (revision_id,))
     assert row is not None
     return str(row["job_id"])

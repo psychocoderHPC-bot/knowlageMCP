@@ -36,6 +36,7 @@ from .models import (
 from .policy import (
     DEFAULT_ROOT_ROLES,
     SlidingWindowLimiter,
+    TokenBucketLimiter,
     audit,
     can_mentor,
     can_read,
@@ -91,6 +92,7 @@ class IdentityManager:
         self._monotonic = monotonic
         self._events = event_sink
         self._limiter = SlidingWindowLimiter(monotonic)
+        self._request_limiter = TokenBucketLimiter(monotonic)
 
     # -- helpers ---------------------------------------------------------
     def _now(self) -> datetime:
@@ -496,11 +498,26 @@ class IdentityManager:
                 ErrorCode.AUTH_REQUIRED,
                 "an actor handle is required when a connection has multiple actors",
             )
-        if actor_handle is None:
-            return session
-        if actor_handle not in handles or not hmac.compare_digest(actor_handle, session.actor_handle):
+        if actor_handle is not None and (
+            actor_handle not in handles or not hmac.compare_digest(actor_handle, session.actor_handle)
+        ):
             raise ServiceError(ErrorCode.AUTH_REQUIRED, "actor handle does not belong to this session")
         return session
+
+    def enforce_request_rate(self, session: SessionInfo) -> None:
+        """Consume one per-session tool request token from ``[limits]``."""
+        limits = self.config.limits
+        allowed, retry = self._request_limiter.allow(
+            f"request:{session.session_id}",
+            limits.requests_per_minute / 60.0,
+            float(limits.request_burst),
+        )
+        if not allowed:
+            raise ServiceError(
+                ErrorCode.RATE_LIMITED,
+                "per-session request rate limit exceeded",
+                retry_after_s=retry,
+            )
 
     def session_close(self, session: SessionInfo) -> dict[str, Any]:
         at = self._now()

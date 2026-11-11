@@ -78,10 +78,8 @@ knowlageMCP-gatewayctl watch
 - `doctor`: checks config validity, permissions, SQLite/FTS5 availability,
   migration version, free space, the listener, the admin socket mode and path,
   optional backend readiness, and host/container connection hints. It never
-  leaks secrets. Note: the current tree reports config, database/schema/FTS5,
-  directory writability, and the listener; the permissions, free-space, and
-  admin-socket checks are being extended into the implementation to match this
-  documented surface, and this line is the contract for that extension.
+  leaks secrets. Each check reports its name, result, and a short detail; a
+  failing check lowers the overall `ok` flag instead of being silently dropped.
 - `smoke-test`: runs health, registration, record, search, and close against
   the live service and prints each step.
 - `watch`: streams audit events live until you interrupt it.

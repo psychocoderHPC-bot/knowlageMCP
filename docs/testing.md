@@ -101,31 +101,28 @@ informational and are never CI gates.
 
 Synthetic corpus (`benchmarks/corpus_v1.json`): 75 entries, 85 labelled
 queries (69 answerable, 12 no-answer, 4 adversarial), and 17 task scenarios,
-with 13 recorded known gaps.
+with 0 recorded known gaps.
 
 | Metric | Value |
 |---|---|
-| recall@5 (69 answerable queries) | 0.884 |
-| precision@5 | 0.363 (reported, not gated) |
+| recall@5 (69 answerable queries) | 1.000 |
+| precision@5 | 0.386 (reported, not gated) |
 | no-answer failures | 0 of 12 |
 | forbidden/private namespace leaks | 0 |
-| context task scenarios passed | 12 of 17 (all 5 misses documented in `known_gaps`) |
+| context task scenarios passed | 17 of 17 (0 misses documented in `known_gaps`) |
 
 Latency (`benchmarks/run_bench.py`, real service layer, 5 results / 4000-byte
 budget per search):
 
 | Workload | p50 | p95 |
 |---|---|---|
-| 1,000 entries, 10 clients | 12.3 ms | 605 ms |
-| 10,000 entries, 1 client | - | 212 ms |
-| 10,000 entries, 10 clients | 41.5 ms | 8.2 s |
+| 1,000 entries, 10 clients | 9.4 ms | 46.8 ms |
+| 10,000 entries, 1 client | 13.0 ms | 28.9 ms |
+| 10,000 entries, 10 clients | 22.0 ms | 181.6 ms |
 
-The 250 ms 10-client p95 target is not met at these sizes: the measured p95
-is 605 ms at 1,000 entries and 8.2 s at 10,000 entries. The tail comes from
-concurrent search threads contending over the single service/database
-connection in the benchmark harness. Timings are reported as information
-only; CI runs deterministic query-plan and bounded-work checks, not
-wall-clock gates.
+The 250 ms 10-client p95 target is met at both measured sizes. Timings are
+reported as information only; CI runs deterministic query-plan and
+bounded-work checks, not wall-clock gates.
 
 Rerun:
 
@@ -164,8 +161,8 @@ simply makes CI green is not accepted without review.
 `--quick`) and concurrent clients, and reports the hardware and query
 distribution. The initial target is p95 bounded FTS search below 250 ms at 10
 concurrent clients on a typical developer workstation; as of 2026-11-11 the
-target is not met on the measured hardware (see "Measured baseline" above)
-and the number stays informational, never a CI gate. Ordinary CI runs
+target is met at the measured sizes (see "Measured baseline" above) and the
+number stays informational, never a CI gate. Ordinary CI runs
 deterministic query-plan and bounded-work checks, not flaky shared runner
 wall-clock gates, and a 50-client concurrent correctness and busy-timeout
 test.

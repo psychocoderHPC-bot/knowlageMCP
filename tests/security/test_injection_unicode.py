@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import httpx2
 import pytest
-from secutil import RunningGateway, auth, count_rows, register, table_names
 
+from conftest import RunningGateway, auth, count_rows, register, table_names
 from knowlage_mcp.retrieval import fts_query
 
 pytestmark = pytest.mark.security

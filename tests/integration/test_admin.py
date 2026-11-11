@@ -33,6 +33,12 @@ def test_admin_socket_permissions_and_status(gateway_server: RunningGateway) -> 
     assert status["schema_version"] >= 1
     assert "database_bytes" in status
 
+    doctor = client.call("doctor")
+    assert doctor["ok"] is True, doctor
+    checks = {check["name"]: check for check in doctor["checks"]}
+    assert checks["listener"]["ok"] is True
+    assert checks["admin_socket"]["ok"] is True
+
 
 def test_enrollment_approval_flow(gateway_server: RunningGateway, admin: AdminClient) -> None:
     with httpx2.Client(base_url=gateway_server.base_url) as http:

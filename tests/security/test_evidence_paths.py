@@ -10,7 +10,8 @@ from urllib.parse import quote
 
 import httpx2
 import pytest
-from secutil import RunningGateway, auth, register
+
+from conftest import RunningGateway, auth, register
 
 pytestmark = pytest.mark.security
 

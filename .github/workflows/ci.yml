@@ -111,7 +111,7 @@ jobs:
         run: |
           python -m venv /tmp/kmcp-venv
           /tmp/kmcp-venv/bin/pip install --upgrade pip
-          /tmp/kmcp-venv/bin/pip install /home/runner/work/knowlageMCP/knowlageMCP/dist/*.whl
+          /tmp/kmcp-venv/bin/pip install "$GITHUB_WORKSPACE"/dist/*.whl
       - name: Verify packaged contents and console script
         working-directory: /tmp
         run: |
