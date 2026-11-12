@@ -77,8 +77,51 @@ keep_weekly = 4
 [logging]
 level = "INFO"
 
-# Optional integrations. All are off by default and never required for core use.
+# Optional semantic/vector layer. Disabled by default; canonical data, ACLs, and review decisions stay in SQLite. Secrets are referenced by environment variable name only.
 [integrations]
-embeddings = false
+enabled = false
 inference = false
 telemetry = false
+
+[integrations.embedding]
+provider = "none"
+model = "text-embedding-3-small"
+base_url = ""
+api_key_env = "KNOWLAGEMCP_EMBEDDING_API_KEY"
+dimensions = 1536
+batch_size = 16
+timeout_s = 20.0
+allow_private_text = false
+
+[integrations.vector]
+backend = "none"
+url = "http://127.0.0.1:6333"
+api_key_env = "KNOWLAGEMCP_QDRANT_API_KEY"
+collection_prefix = "knowlagemcp"
+vector_size = 1536
+distance = "Cosine"
+timeout_s = 10.0
+top_k = 40
+hybrid = true
+
+[integrations.reranker]
+provider = "none"
+model = "rerank-1"
+base_url = ""
+api_key_env = "KNOWLAGEMCP_RERANK_API_KEY"
+top_n = 20
+timeout_s = 10.0
+
+[integrations.graphiti]
+enabled = false
+base_url = "http://127.0.0.1:8000"
+api_key_env = "KNOWLAGEMCP_GRAPHITI_API_KEY"
+timeout_s = 20.0
+max_calls_per_task = 4
+
+[integrations.mem0]
+enabled = false
+base_url = "http://127.0.0.1:8001"
+api_key_env = "KNOWLAGEMCP_MEM0_API_KEY"
+timeout_s = 20.0
+max_items = 20

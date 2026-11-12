@@ -130,11 +130,100 @@ evidence inventory, and the application version.
 
 ## [integrations]
 
+The optional semantic/vector layer. Every adapter is off by default; with
+`enabled = false` the service constructs only offline null adapters and makes
+no network I/O. Secrets are referenced by environment variable name only; no
+config key holds a key value. See [integrations.md](integrations.md) for the
+architecture, operations, and failure semantics.
+
 | Key | Default | Effect |
 |---|---|---|
-| `embeddings` | `false` | Optional embedding backend. Off by default; the core never calls an external model. |
-| `inference` | `false` | Optional inference backend. Off by default. |
+| `enabled` | `false` | Master switch for the layer. `false` disables all adapters and keeps search lexical FTS5. |
+| `inference` | `false` | Reserved. No inference backend ships in this release. |
 | `telemetry` | `false` | Telemetry is disabled and stays off. |
+
+### [integrations.embedding]
+
+| Key | Default | Effect |
+|---|---|---|
+| `provider` | `none` | `none`, `hash` (deterministic offline development/test provider, not a semantic model), or `openai` (OpenAI-compatible `POST {base_url}/embeddings`). |
+| `model` | `text-embedding-3-small` | Model name sent to the provider. Must not be empty; required for `openai`. |
+| `base_url` | `""` | Base URL of the embedding endpoint. Must be an http(s) URL when `provider = "openai"`; empty means the openai provider is unavailable. |
+| `api_key_env` | `KNOWLAGEMCP_EMBEDDING_API_KEY` | Name of the environment variable holding the API key. The key value is read per request, never stored or logged. Must be a valid environment variable name. |
+| `dimensions` | `1536` | Expected vector length. Must be positive. A response with another length is a hard `BACKEND_UNAVAILABLE` error. Must equal `integrations.vector.vector_size` when a qdrant backend is configured with a real provider. |
+| `batch_size` | `16` | Inputs per `POST /embeddings` batch. Must be positive. |
+| `timeout_s` | `20.0` | Per-request timeout. Must be positive. |
+| `allow_private_text` | `false` | Must be `true` before personal/private namespace text is embedded and indexed by a remote provider. Local providers (`none`, `hash`) never leave the host. This gates indexing, not search: query text still goes to the configured endpoint on every semantic search. |
+
+### [integrations.vector]
+
+| Key | Default | Effect |
+|---|---|---|
+| `backend` | `none` | `none` or `qdrant`. The index is derived and rebuildable; it is never authoritative for ACL or review. |
+| `url` | `http://127.0.0.1:6333` | Qdrant REST endpoint. Must be an http(s) URL when `backend = "qdrant"`. |
+| `api_key_env` | `KNOWLAGEMCP_QDRANT_API_KEY` | Environment variable name for the Qdrant API key, sent as a Bearer token when set. |
+| `collection_prefix` | `knowlagemcp` | Prefix of the per-generation collection names (`prefix_gen_<16 hex>`). Must not be empty. |
+| `vector_size` | `1536` | Vector dimension of the collection. Must be positive and equal `integrations.embedding.dimensions` for `hash` or `openai` providers. |
+| `distance` | `Cosine` | `Cosine`, `Euclid`, or `Dot` (aliases like `euclidean` are normalized). |
+| `timeout_s` | `10.0` | Per-request timeout. Must be positive. |
+| `top_k` | `40` | Base bound for the vector candidate pool. A query fetches `min(max(top_k, 4 * max_results), 100)`. Must be positive. |
+| `hybrid` | `true` | When false, vector candidates are not merged into results even if the index is healthy. |
+
+### [integrations.reranker]
+
+| Key | Default | Effect |
+|---|---|---|
+| `provider` | `none` | `none`, `lexical` (offline, deterministic token overlap), or `openai` (`POST {base_url}/rerank`). |
+| `model` | `rerank-1` | Model name. Must not be empty for `openai`. |
+| `base_url` | `""` | Base URL of the rerank endpoint. Must be an http(s) URL when `provider = "openai"`. |
+| `api_key_env` | `KNOWLAGEMCP_RERANK_API_KEY` | Environment variable name for the reranker API key. |
+| `top_n` | `20` | Maximum number of already-authorized candidates offered to the reranker. Must be positive. The reranker reorders this set only; it cannot add or remove entries. |
+| `timeout_s` | `10.0` | Per-request timeout. Must be positive. |
+
+### [integrations.graphiti]
+
+| Key | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Enable the proposal-only Graphiti extraction adapter. |
+| `base_url` | `http://127.0.0.1:8000` | Graphiti-compatible endpoint. Must be an http(s) URL when enabled. |
+| `api_key_env` | `KNOWLAGEMCP_GRAPHITI_API_KEY` | Environment variable name for the API key. |
+| `timeout_s` | `20.0` | Per-request timeout. Must be positive. |
+| `max_calls_per_task` | `4` | Bound on extraction calls. Must be positive. |
+
+### [integrations.mem0]
+
+| Key | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Enable the proposal-only Mem0 extraction adapter. If both Graphiti and Mem0 are enabled, Graphiti is selected. |
+| `base_url` | `http://127.0.0.1:8001` | Mem0-compatible endpoint. Must be an http(s) URL when enabled. |
+| `api_key_env` | `KNOWLAGEMCP_MEM0_API_KEY` | Environment variable name for the API key. |
+| `timeout_s` | `20.0` | Per-request timeout. Must be positive. |
+| `max_items` | `20` | Maximum proposals per extraction call and per `import-memories` run. Must be positive. |
+
+### Legacy keys
+
+The old flat `integrations.embeddings` boolean is no longer a valid key for
+new configuration. Loading a file that still contains it migrates it:
+`false` becomes `embedding.provider = "none"`, `true` becomes
+`embedding.provider = "hash"`. An explicit `integrations.embedding.provider`
+always wins, so a partially migrated file keeps its intent. A non-boolean
+value for the legacy key is a configuration error.
+
+### Privacy rules
+
+- A configured remote embedding provider is an explicit operator decision.
+  Query text is sent to `integrations.embedding.base_url` on every semantic
+  search, even when `allow_private_text = false`.
+- `allow_private_text` gates indexing: personal and private namespace content
+  is embedded and indexed only when it is `true`; otherwise that content
+  stays in SQLite and is reachable only through lexical search.
+- Local providers (`none`, `hash`) never send text off the host.
+- Extractor adapters (Graphiti, Mem0) send bounded text to their configured
+  endpoints only when explicitly enabled and only when an operator invokes
+  `integrations extract` or `integrations import-memories`.
+- API keys are referenced by environment variable name in the config and
+  read at request time; key values never appear in config files, logs, or
+  error messages.
 
 ## Checking, displaying, and reloading
 

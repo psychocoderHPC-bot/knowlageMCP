@@ -26,7 +26,8 @@ API keys, embeddings, a mentor, or any external service.
 
 ## Requirements
 
-- Linux host, Python 3.11 or newer, `git`, and `pipx` (or a virtualenv).
+- Linux host, Python 3.11 or newer (tested on 3.11, 3.12, 3.13 and 3.14),
+  `git`, and `pipx` (or a virtualenv).
 - SQLite with FTS5 (standard in current system SQLite builds).
 - For container access: terok network access to the host service, or a
   manually reachable host port. See the note under "Agent setup".
@@ -167,6 +168,41 @@ Approval is bound to the exact pending session and requested scopes, expires
 after the TTL, and is revocable. Without an approved mentor, all normal
 read/write work continues and reviews simply stay queued.
 
+## Optional semantic search
+
+Hybrid search (lexical FTS5 plus a Qdrant vector index), a bounded reranker,
+and extraction adapters are optional and off by default. To enable a minimal
+setup in the config file:
+
+```toml
+[integrations]
+enabled = true
+
+[integrations.embedding]
+provider = "openai"
+base_url = "http://127.0.0.1:8080"
+dimensions = 1536
+
+[integrations.vector]
+backend = "qdrant"
+url = "http://127.0.0.1:6333"
+vector_size = 1536
+
+[integrations.reranker]
+provider = "lexical"
+```
+
+then rebuild the index once:
+
+```bash
+knowlageMCP-gatewayctl integrations reindex
+```
+
+The core runs fully without any of it: with `integrations.enabled = false`
+search stays lexical, no network I/O happens, and no secrets are required.
+Search remains fail-open when a backend is down. Details, operations, and
+failure semantics are in [docs/integrations.md](docs/integrations.md).
+
 ## Smoke test
 
 With the gateway running and at least one agent container connected (the
@@ -213,5 +249,5 @@ latency baseline on the reference hardware.
   Sybil behaviour in general.
 - Backups live on the same disk and do not protect against disk loss.
 - There is no high availability, no multi-host SQLite, and no web dashboard.
-- Search is lexical (FTS5) in this release; semantic search is an optional
-  future adapter, off by default.
+- Search is lexical (FTS5) by default. Semantic/hybrid search is an optional
+  layer, off by default, and never mandatory (see "Optional semantic search").

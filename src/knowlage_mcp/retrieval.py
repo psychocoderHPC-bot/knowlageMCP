@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import re
@@ -15,6 +16,8 @@ from typing import Any, TypeVar
 
 from .config import Config
 from .db import Database, iso, parse_iso
+from .integrations.base import RerankCandidate, VectorHit, VectorItem
+from .integrations.registry import IntegrationRegistry
 from .knowledge import build_entry_detail
 from .models import (
     ContextBundle,
@@ -39,6 +42,9 @@ _MAX_LIKE_TERMS = 16
 #: Bound the candidate pool fed to ranking. Ranking is cheap over a few dozen
 #: rows; the expensive part is materializing every FTS/LIKE match first.
 _MAX_CANDIDATE_POOL = 100
+#: Reciprocal-rank-fusion constant. The standardized value damps the top ranks
+#: so a lexical and a vector hit agree on ordering without either dominating.
+_RRF_K = 60
 #: Keep provenance lookups under SQLite's default parameter limit.
 _CONTRADICTION_CHUNK = 400
 
@@ -196,10 +202,18 @@ def _row_to_candidate(row: sqlite3.Row) -> dict[str, Any]:
 class RetrievalManager:
     """Retrieval is ACL-first; ranking never widens visibility."""
 
-    def __init__(self, config: Config, db: Database, *, clock: Callable[[], float]) -> None:
+    def __init__(
+        self,
+        config: Config,
+        db: Database,
+        *,
+        clock: Callable[[], float],
+        integrations: IntegrationRegistry | None = None,
+    ) -> None:
         self.config = config
         self.db = db
         self._clock = clock
+        self.integrations = integrations if integrations is not None else IntegrationRegistry(config)
 
     def _now(self) -> datetime:
         return now_from(self._clock)
@@ -515,6 +529,270 @@ class RetrievalManager:
         return kept
 
     # -- public search ---------------------------------------------------
+    @staticmethod
+    def _rrf(rank: int) -> float:
+        return 1.0 / (_RRF_K + rank)
+
+    def _readable_for(self, session: SessionInfo) -> set[str]:
+        conn = self.db.connect()
+        return set(readable_namespaces(conn, session.agent_id, self._now()))
+
+    def _hydrate_vector_hits(
+        self,
+        hits: Iterable[VectorHit],
+        *,
+        filters: SearchFilters,
+        include_candidates: bool,
+        readable: set[str],
+        query: str,
+    ) -> list[SearchResult]:
+        ordered = list(hits)
+        revision_ids = list(dict.fromkeys(hit.revision_id for hit in ordered))
+        if not revision_ids:
+            return []
+        placeholders = ",".join("?" for _ in revision_ids)
+        conn = self.db.connect()
+        rows = conn.execute(
+            f"""
+            SELECT e.entry_id, e.namespace, e.current_revision_id, r.revision_id, r.kind,
+                   r.lifecycle, r.evidence_class, r.title, r.claim, r.tags, r.scope,
+                   r.author_agent_id, r.author_root_id, r.contributors, r.content_hash,
+                   r.created_at, NULL AS rank
+            FROM entry_revisions r
+            JOIN entries e ON e.entry_id = r.entry_id
+            WHERE r.revision_id IN ({placeholders})
+            """,
+            tuple(revision_ids),
+        ).fetchall()
+        by_revision = {str(row["revision_id"]): row for row in rows}
+        allowed = self._lifecycle_allowed(filters, include_candidates)
+        accepted: list[tuple[dict[str, Any], VectorHit]] = []
+        for hit in ordered:
+            row = by_revision.get(hit.revision_id)
+            if row is None:
+                continue
+            # The canonical row is authoritative; a payload that disagrees with
+            # SQLite is treated as a malformed point.
+            if str(row["entry_id"]) != hit.entry_id:
+                continue
+            namespace = str(row["namespace"])
+            if namespace not in readable:
+                continue
+            if str(row["revision_id"]) != str(row["current_revision_id"]):
+                continue
+            candidate = _row_to_candidate(row)
+            if candidate["lifecycle"] not in allowed:
+                continue
+            if not self._passes_filters(candidate, filters):
+                continue
+            if self._applicability(candidate["scope"], filters.scope) != 0:
+                continue
+            accepted.append((candidate, hit))
+
+        contradictions_by_revision = self._contradictions_for(
+            candidate["revision_id"] for candidate, _hit in accepted
+        )
+        results: list[SearchResult] = []
+        seen: set[str] = set()
+        for candidate, _hit in accepted:
+            if candidate["entry_id"] in seen:
+                continue
+            seen.add(candidate["entry_id"])
+            lifecycle = candidate["lifecycle"]
+            contradictions = contradictions_by_revision.get(candidate["revision_id"], ())
+            warnings: list[str] = ["semantic match"]
+            warnings.extend(f"contradicts revision {other}" for other in contradictions)
+            if lifecycle == Lifecycle.DISPUTED:
+                warnings.append("disputed: credible conflicting evidence exists")
+            if lifecycle == Lifecycle.CANDIDATE:
+                warnings.append("low trust: candidate has not been reviewed")
+            reasons: list[str] = ["semantic match"]
+            if lifecycle == Lifecycle.PUBLISHED:
+                reasons.append("published")
+            if not filters.scope.is_empty():
+                reasons.append("scope matches query")
+            if _exact_identifier_match(query, candidate):
+                reasons.append("exact identifier match")
+            if candidate["evidence_class"] is not EvidenceClass.UNVERIFIED:
+                reasons.append(f"evidence: {candidate['evidence_class'].value}")
+            if contradictions:
+                reasons.append("contradiction visible")
+            if lifecycle == Lifecycle.CANDIDATE:
+                reasons.append("candidate low trust")
+            results.append(
+                SearchResult(
+                    entry_id=candidate["entry_id"],
+                    revision_id=candidate["revision_id"],
+                    namespace=candidate["namespace"],
+                    kind=candidate["kind"],
+                    lifecycle=lifecycle,
+                    evidence_class=candidate["evidence_class"],
+                    title=candidate["title"],
+                    claim=candidate["claim"],
+                    tags=candidate["tags"],
+                    scope=candidate["scope"],
+                    score=0.0,
+                    updated_at=candidate["created_at"],
+                    low_trust=lifecycle == Lifecycle.CANDIDATE,
+                    warnings=tuple(warnings),
+                    contradictions=contradictions,
+                    selection_reasons=_bounded_reasons(reasons),
+                )
+            )
+        return results
+
+    def _semantic_merge(
+        self,
+        *,
+        session: SessionInfo,
+        namespaces: list[str],
+        query: str,
+        filters: SearchFilters,
+        include_candidates: bool,
+        ranked: list[SearchResult],
+        max_results: int,
+    ) -> tuple[list[SearchResult], dict[str, Any]]:
+        """Merge lexical and vector candidates. Returns a warning on skip."""
+        meta: dict[str, Any] = {
+            "retrieval_backend": "fts5",
+            "semantic_used": False,
+            "reranked": False,
+            "index_generation": None,
+            "warnings": (),
+        }
+        if not self.integrations.enabled:
+            return ranked, meta
+        vector = self.integrations.vector
+        if self.config.integrations.vector.backend != "none" and not vector.available:
+            meta.update(
+                {
+                    "retrieval_backend": "fts5",
+                    "semantic_used": False,
+                    "warnings": (
+                        "semantic index unavailable: run knowlageMCP-gatewayctl integrations reindex",
+                    ),
+                }
+            )
+            return ranked, meta
+        if not self.config.integrations.vector.hybrid:
+            return ranked, meta
+        embedding = self.integrations.embedding
+        if not embedding.available or not vector.available:
+            return ranked, meta
+
+        vectors = embedding.embed([query])
+        if not vectors:
+            raise ServiceError(ErrorCode.BACKEND_UNAVAILABLE, "embedding returned no vector")
+        vector_values = list(vectors[0])
+        expected = int(self.config.integrations.vector.vector_size)
+        if len(vector_values) != expected:
+            raise ServiceError(
+                ErrorCode.BACKEND_UNAVAILABLE,
+                "embedding dimension does not match the vector index",
+            )
+        readable = self._readable_for(session)
+        names = [namespace for namespace in namespaces if namespace in readable]
+        if not names:
+            return ranked, meta
+        limit = min(max(self.config.integrations.vector.top_k, 4 * max_results), 100)
+        hits = vector.search(
+            vector_values,
+            limit=limit,
+            namespaces=names,
+            allow_candidates=include_candidates,
+        )
+        vector_results = self._hydrate_vector_hits(
+            hits,
+            filters=filters,
+            include_candidates=include_candidates,
+            readable=readable,
+            query=query,
+        )
+        if not vector_results:
+            meta.update(
+                {
+                    "retrieval_backend": "hybrid",
+                    "semantic_used": True,
+                    "index_generation": vector.generation_id or None,
+                }
+            )
+            return ranked, meta
+
+        lexical_by_id = {result.entry_id: result for result in ranked}
+        lexical_rank = {result.entry_id: index for index, result in enumerate(ranked)}
+        vector_by_id = {result.entry_id: result for result in vector_results}
+        vector_rank = {result.entry_id: index for index, result in enumerate(vector_results)}
+        merged_ids = set(lexical_by_id) | set(vector_by_id)
+
+        def fused_score(entry_id: str) -> float:
+            score = 0.0
+            if entry_id in lexical_rank:
+                score += self._rrf(lexical_rank[entry_id] + 1)
+            if entry_id in vector_rank:
+                score += self._rrf(vector_rank[entry_id] + 1)
+            return score
+
+        ordered_ids = sorted(
+            merged_ids,
+            key=lambda entry_id: (
+                -fused_score(entry_id),
+                lexical_rank.get(entry_id, _MAX_CANDIDATE_POOL + 1),
+                vector_rank.get(entry_id, _MAX_CANDIDATE_POOL + 1),
+                entry_id,
+            ),
+        )
+        merged: list[SearchResult] = []
+        for entry_id in ordered_ids:
+            result = lexical_by_id.get(entry_id)
+            if result is None:
+                result = vector_by_id[entry_id].model_copy(update={"score": fused_score(entry_id)})
+            merged.append(result)
+
+        reranker = self.integrations.reranker
+        reranked = False
+        if reranker.available:
+            top_n = max(1, self.config.integrations.reranker.top_n)
+            head = merged[:top_n]
+            tail = merged[top_n:]
+            candidates = [
+                RerankCandidate(
+                    entry_id=result.entry_id,
+                    revision_id=result.revision_id,
+                    title=result.title,
+                    claim=result.claim,
+                    scope=result.scope.model_dump(exclude_none=True),
+                    evidence_class=result.evidence_class.value,
+                    tags=tuple(result.tags),
+                )
+                for result in head
+            ]
+            order = reranker.rerank(query, candidates, top_n)
+            allowed_ids = {candidate.entry_id for candidate in candidates}
+            by_id = {result.entry_id: result for result in head}
+            reordered: list[SearchResult] = []
+            seen: set[str] = set()
+            for entry_id in order:
+                # A reranker reorders the authorized set only. Unknown ids and
+                # duplicates are ignored; it can never add or remove an entry.
+                if entry_id in allowed_ids and entry_id in by_id and entry_id not in seen:
+                    reordered.append(by_id[entry_id])
+                    seen.add(entry_id)
+            for result in head:
+                if result.entry_id not in seen:
+                    reordered.append(result)
+            merged = reordered + tail
+            reranked = True
+
+        meta.update(
+            {
+                "retrieval_backend": "hybrid",
+                "semantic_used": True,
+                "reranked": reranked,
+                "index_generation": vector.generation_id or None,
+            }
+        )
+        return merged, meta
+
     def _run_search(
         self,
         namespaces: list[str],
@@ -525,6 +803,8 @@ class RetrievalManager:
         max_bytes: int,
         cursor: str | None,
         include_candidates: bool,
+        session: SessionInfo | None = None,
+        semantic: bool = False,
     ) -> SearchResponse:
         query_hash = hashlib.sha256(
             json.dumps(
@@ -552,6 +832,22 @@ class RetrievalManager:
             limit=candidate_limit,
         )
         ranked = self._rank(candidates.values(), filters, include_candidates, query=query)
+        metadata: dict[str, Any] = {}
+        if semantic and session is not None and query.strip():
+            try:
+                ranked, metadata = self._semantic_merge(
+                    session=session,
+                    namespaces=namespaces,
+                    query=query,
+                    filters=filters,
+                    include_candidates=include_candidates,
+                    ranked=ranked,
+                    max_results=max_results,
+                )
+            except ServiceError as exc:
+                metadata = {"warnings": (f"semantic backend unavailable: {exc.code.value}",)}
+            except Exception:
+                metadata = {"warnings": ("semantic backend unavailable: INTERNAL",)}
         total = len(ranked)
         if offset > total:
             offset = total
@@ -583,6 +879,7 @@ class RetrievalManager:
                 truncated=truncated,
                 next_cursor=next_cursor,
                 approx_bytes=approx_bytes,
+                **metadata,
             )
         )
 
@@ -610,6 +907,8 @@ class RetrievalManager:
             max_bytes=max_bytes,
             cursor=request.cursor,
             include_candidates=include_candidates,
+            session=session,
+            semantic=True,
         )
 
     def admin_search(
@@ -650,6 +949,8 @@ class RetrievalManager:
             max_bytes=min(2000, self.config.limits.search_max_bytes),
             cursor=None,
             include_candidates=False,
+            session=session,
+            semantic=True,
         )
         return _with_token_estimate(
             ContextBundle(
@@ -657,6 +958,11 @@ class RetrievalManager:
                 namespaces=tuple(sorted(readable)),
                 approx_bytes=response.approx_bytes,
                 truncated=response.truncated,
+                retrieval_backend=response.retrieval_backend,
+                semantic_used=response.semantic_used,
+                reranked=response.reranked,
+                index_generation=response.index_generation,
+                warnings=response.warnings,
             )
         )
 
@@ -708,6 +1014,115 @@ class RetrievalManager:
             update={"next_cursor": None, "approx_bytes": len(base.model_dump_json().encode("utf-8"))}
         )
 
+    # -- derived index maintenance ---------------------------------------
+    def _vector_ready(self) -> bool:
+        if not self.integrations.enabled:
+            return False
+        if self.config.integrations.vector.backend == "none":
+            return False
+        if not self.integrations.embedding.available:
+            return False
+        return bool(self.integrations.vector.generation_id) and bool(self.integrations.vector.available)
+
+    def _mark_generation(self, generation: str, state: str, at: datetime) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE index_generations SET state = ?, updated_at = ? WHERE generation_id = ?",
+                (state, iso(at), generation),
+            )
+
+    def _index_entry_row(self, row: sqlite3.Row) -> bool:
+        """Embed and upsert one revision. Returns False when skipped."""
+        namespace_kind_value = str(row["namespace_kind"])
+        if not self.config.integrations.embedding.embedding_may_send(namespace_kind_value):
+            return False
+        lifecycle = str(row["lifecycle"])
+        if lifecycle in {Lifecycle.ARCHIVED.value, Lifecycle.SUPERSEDED.value}:
+            return False
+        dimensions = int(self.integrations.embedding.dimensions)
+        vectors = self.integrations.embedding.embed([f"{row['title']}\n{row['claim']}"])
+        if not vectors or len(vectors[0]) != dimensions:
+            raise ServiceError(
+                ErrorCode.BACKEND_UNAVAILABLE,
+                "embedding dimension does not match the vector index",
+            )
+        item = VectorItem(
+            entry_id=str(row["entry_id"]),
+            revision_id=str(row["revision_id"]),
+            namespace=str(row["namespace"]),
+            vector=tuple(float(value) for value in vectors[0]),
+            payload={
+                "entry_id": str(row["entry_id"]),
+                "revision_id": str(row["revision_id"]),
+                "namespace": str(row["namespace"]),
+                "lifecycle": lifecycle,
+                "evidence_class": str(row["evidence_class"]),
+                "content_hash": str(row["content_hash"]),
+                "scope": _row_scope_json(row["scope"]),
+                "author_root_id": str(row["author_root_id"]),
+            },
+        )
+        self.integrations.vector.upsert([item])
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO entry_index_state "
+                "(generation_id, revision_id, backend, content_hash, indexed_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    self.integrations.vector.generation_id,
+                    str(row["revision_id"]),
+                    self.config.integrations.vector.backend,
+                    str(row["content_hash"]),
+                    iso(self._now()),
+                ),
+            )
+        return True
+
+    def index_entry_revision(self, entry_id: str, revision_id: str) -> None:
+        """Best-effort index of one current revision after a write commits."""
+        if not self._vector_ready():
+            return
+        conn = self.db.connect()
+        row = conn.execute(
+            """
+            SELECT e.entry_id, e.namespace, r.revision_id, r.lifecycle, r.evidence_class,
+                   r.title, r.claim, r.scope, r.content_hash, r.author_root_id,
+                   n.kind AS namespace_kind
+            FROM entry_revisions r
+            JOIN entries e ON e.entry_id = r.entry_id
+            JOIN namespaces n ON n.name = e.namespace
+            WHERE r.revision_id = ? AND e.current_revision_id = r.revision_id
+            """,
+            (revision_id,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            self._index_entry_row(row)
+        except Exception:
+            # A derived index never fails a canonical write.
+            return
+
+    def remove_from_vector(self, entry_id: str) -> str | None:
+        """Delete an entry from the derived index. Returns a warning on failure."""
+        try:
+            if not self.integrations.enabled:
+                return None
+            if self.config.integrations.vector.backend == "none":
+                return None
+            self.integrations.vector.delete([entry_id])
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "DELETE FROM entry_index_state WHERE revision_id IN "
+                    "(SELECT revision_id FROM entry_revisions WHERE entry_id = ?)",
+                    (entry_id,),
+                )
+        except ServiceError as exc:
+            return f"vector index cleanup failed: {exc.code.value}"
+        except Exception:
+            return "vector index cleanup failed: INTERNAL"
+        return None
+
     def index_rebuild(self) -> dict[str, Any]:
         at = self._now()
         with self.db.transaction() as conn:
@@ -734,7 +1149,161 @@ class RetrievalManager:
                 "VALUES (?, NULL, 'index.rebuild', 'fts', NULL, ?)",
                 (iso(at), json.dumps({"indexed": len(rows)})),
             )
-            return {"indexed": len(rows)}
+        fts_count = len(rows)
+        backend = self.config.integrations.vector.backend
+        if not self.integrations.enabled or backend == "none" or not self.integrations.embedding.available:
+            return {"generation": None, "backend": backend, "indexed": fts_count}
+        return self._rebuild_vector(fts_count)
+
+    def _rebuild_vector(self, fts_count: int) -> dict[str, Any]:
+        embedding = self.integrations.embedding
+        vector = self.integrations.vector
+        backend = self.config.integrations.vector.backend
+        model = embedding.model
+        dimensions = int(embedding.dimensions)
+        at = self._now()
+        generation = ""
+        try:
+            generation = vector.ensure_generation(model, dimensions)
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE index_generations SET state = 'stale', updated_at = ? "
+                    "WHERE backend = ? AND state = 'ready' AND generation_id != ?",
+                    (iso(at), backend, generation),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO index_generations "
+                    "(generation_id, backend, model, dimensions, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'building', ?, ?)",
+                    (generation, backend, model, dimensions, iso(at), iso(at)),
+                )
+            conn = self.db.connect()
+            rows = conn.execute(
+                """
+                SELECT e.entry_id, e.namespace, r.revision_id, r.lifecycle, r.evidence_class,
+                       r.title, r.claim, r.scope, r.content_hash, r.author_root_id,
+                       n.kind AS namespace_kind
+                FROM entry_revisions r
+                JOIN entries e ON e.entry_id = r.entry_id
+                JOIN namespaces n ON n.name = e.namespace
+                WHERE r.lifecycle NOT IN ('archived', 'superseded')
+                ORDER BY r.created_at
+                """
+            ).fetchall()
+            batch_size = max(1, int(self.config.integrations.embedding.batch_size))
+            indexed = 0
+            skipped_private = 0
+            batches = 0
+            pending: list[sqlite3.Row] = []
+            for row in rows:
+                if not self.config.integrations.embedding.embedding_may_send(str(row["namespace_kind"])):
+                    skipped_private += 1
+                    continue
+                pending.append(row)
+            for start in range(0, len(pending), batch_size):
+                chunk = pending[start : start + batch_size]
+                if not self._index_entry_chunk(chunk, generation):
+                    continue
+                indexed += len(chunk)
+                batches += 1
+            self._mark_generation(generation, "ready", self._now())
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO audit_events "
+                    "(ts, actor_agent_id, action, object_type, object_id, details) "
+                    "VALUES (?, NULL, 'index.rebuild', ?, NULL, ?)",
+                    (
+                        iso(self._now()),
+                        backend,
+                        json.dumps(
+                            {
+                                "generation": generation,
+                                "indexed": indexed,
+                                "skipped_private": skipped_private,
+                                "batches": batches,
+                            }
+                        ),
+                    ),
+                )
+            return {
+                "generation": generation,
+                "indexed": indexed,
+                "skipped_private": skipped_private,
+                "batches": batches,
+                "backend": backend,
+            }
+        except Exception as exc:
+            if generation:
+                with contextlib.suppress(Exception):
+                    self._mark_generation(generation, "failed", self._now())
+            if isinstance(exc, ServiceError) and exc.code is ErrorCode.BACKEND_UNAVAILABLE:
+                raise
+            raise ServiceError(
+                ErrorCode.BACKEND_UNAVAILABLE,
+                "vector index rebuild failed",
+            ) from exc
+
+    def _index_entry_chunk(self, chunk: list[sqlite3.Row], generation: str) -> bool:
+        dimensions = int(self.integrations.embedding.dimensions)
+        texts = [f"{row['title']}\n{row['claim']}" for row in chunk]
+        vectors = self.integrations.embedding.embed(texts)
+        if len(vectors) != len(chunk):
+            raise ServiceError(
+                ErrorCode.BACKEND_UNAVAILABLE,
+                "embedding returned the wrong number of vectors",
+            )
+        items: list[VectorItem] = []
+        for row, vector in zip(chunk, vectors, strict=True):
+            if len(vector) != dimensions:
+                raise ServiceError(
+                    ErrorCode.BACKEND_UNAVAILABLE,
+                    "embedding dimension does not match the vector index",
+                )
+            items.append(
+                VectorItem(
+                    entry_id=str(row["entry_id"]),
+                    revision_id=str(row["revision_id"]),
+                    namespace=str(row["namespace"]),
+                    vector=tuple(float(value) for value in vector),
+                    payload={
+                        "entry_id": str(row["entry_id"]),
+                        "revision_id": str(row["revision_id"]),
+                        "namespace": str(row["namespace"]),
+                        "lifecycle": str(row["lifecycle"]),
+                        "evidence_class": str(row["evidence_class"]),
+                        "content_hash": str(row["content_hash"]),
+                        "scope": _row_scope_json(row["scope"]),
+                        "author_root_id": str(row["author_root_id"]),
+                    },
+                )
+            )
+        self.integrations.vector.upsert(items)
+        conn = self.db.connect()
+        with self.db.transaction():
+            for row in chunk:
+                conn.execute(
+                    "INSERT OR REPLACE INTO entry_index_state "
+                    "(generation_id, revision_id, backend, content_hash, indexed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        generation,
+                        str(row["revision_id"]),
+                        self.config.integrations.vector.backend,
+                        str(row["content_hash"]),
+                        iso(self._now()),
+                    ),
+                )
+        return True
+
+
+def _row_scope_json(value: object) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 __all__ = [

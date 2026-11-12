@@ -46,3 +46,29 @@ Keep a Changelog and the project uses Semantic Versioning.
 - Operator and protocol documentation, REUSE-compliant licensing metadata, and
   CI for linting, formatting, type checking, tests, package build, and a
   wheel-install smoke test.
+
+#### Optional integrations
+
+- Qdrant hybrid retrieval as a derived, rebuildable vector index: generation
+  and collection lifecycle, deterministic UUID5 point ids, namespace and
+  lifecycle filters, reciprocal rank fusion with the lexical FTS5 rank, and
+  ACL/scope/lifecycle re-check against SQLite for every vector hit.
+- OpenAI-compatible embeddings (`POST {base_url}/embeddings`) with batching,
+  conditional `dimensions` for `text-embedding-3*` models, and hard
+  dimension-mismatch errors; plus a deterministic offline `hash` provider for
+  development and tests.
+- Bounded rerankers over already-authorized candidates: offline `lexical`
+  (deterministic token overlap) and `openai` (`POST {base_url}/rerank`),
+  fail-open with a response warning.
+- Proposal-only Graphiti and Mem0 extraction adapters (`extract`,
+  `import-memories`, `proposals`) that never publish; acceptance goes through
+  the normal candidate/review path.
+- Feature flags off by default: `integrations.enabled = false` is the master
+  switch, every adapter defaults to `none`/disabled, and no network I/O
+  happens at import or while disabled.
+- Contract tests over fake Qdrant/embeddings/reranker/Graphiti/Mem0 servers
+  (ACL, scope, deletion, offline fallback) and one real-HTTP end-to-end test,
+  with no external network access in CI.
+- Real-HTTP contract tests against loopback fake Qdrant, embeddings, Graphiti,
+  and Mem0 servers that drive the production configuration, registry, and
+  adapter path over real sockets without external network access.

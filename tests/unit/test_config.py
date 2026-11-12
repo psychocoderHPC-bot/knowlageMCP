@@ -14,6 +14,7 @@ import tomli_w
 from knowlage_mcp import config as config_module
 from knowlage_mcp.config import (
     Config,
+    EmbeddingIntegrationConfig,
     IdentityConfig,
     ServerConfig,
     StorageConfig,
@@ -24,6 +25,7 @@ from knowlage_mcp.config import (
     load_config,
     parse_duration,
     redact_config,
+    show_config,
     validate_config,
     write_config_atomic,
 )
@@ -46,7 +48,12 @@ def test_defaults_match_spec(tmp_config: Config) -> None:
     assert tmp_config.limits.search_max_results == 10
     assert tmp_config.review.lease_seconds == 600
     assert tmp_config.retrieval.backend == "fts5"
-    assert tmp_config.integrations.embeddings is False
+    assert tmp_config.integrations.enabled is False
+    assert tmp_config.integrations.embedding.provider == "none"
+    assert tmp_config.integrations.vector.backend == "none"
+    assert tmp_config.integrations.reranker.provider == "none"
+    assert tmp_config.integrations.graphiti.enabled is False
+    assert tmp_config.integrations.mem0.enabled is False
     assert tmp_config.storage.database.is_absolute()
     assert validate_config(tmp_config) == []
 
@@ -171,6 +178,9 @@ def test_check_example_configuration(repo_root: Path) -> None:
     assert cfg.server.port == 2230
     assert cfg.identity.session_idle_timeout == 28800
     assert cfg.storage.database.is_absolute()
+    assert cfg.integrations.enabled is False
+    assert cfg.integrations.embedding.provider == "none"
+    assert cfg.integrations.vector.vector_size == cfg.integrations.embedding.dimensions
 
 
 def test_load_config_missing_default_returns_defaults(isolated_env: Path) -> None:
@@ -204,3 +214,171 @@ def test_utc_helpers() -> None:
     encoded = iso(stamp)
     assert encoded.endswith("Z")
     assert "T" in encoded
+
+
+def test_integration_master_switch_defaults_off(tmp_config: Config) -> None:
+    integrations = tmp_config.integrations
+    assert integrations.enabled is False
+    assert integrations.inference is False
+    assert integrations.telemetry is False
+    assert integrations.embedding.dimensions == 1536
+    assert integrations.vector.distance == "Cosine"
+    assert integrations.vector.top_k == 40
+    assert integrations.reranker.top_n == 20
+    assert integrations.graphiti.max_calls_per_task == 4
+    assert integrations.mem0.max_items == 20
+
+
+def test_legacy_boolean_embeddings_key_is_migrated() -> None:
+    disabled = Config.from_toml_dict({"integrations": {"embeddings": False}})
+    assert disabled.integrations.embedding.provider == "none"
+    enabled = Config.from_toml_dict({"integrations": {"embeddings": True}})
+    assert enabled.integrations.embedding.provider == "hash"
+    explicit = Config.from_toml_dict(
+        {
+            "integrations": {
+                "embeddings": True,
+                "embedding": {"provider": "openai", "base_url": "https://example.invalid/v1"},
+            }
+        }
+    )
+    assert explicit.integrations.embedding.provider == "openai"
+    with pytest.raises(ValueError):
+        Config.from_toml_dict({"integrations": {"embeddings": "yes"}})
+
+
+def test_integration_enums_reject_unknown_values() -> None:
+    for payload in (
+        {"embedding": {"provider": "bogus"}},
+        {"vector": {"backend": "bogus"}},
+        {"vector": {"distance": "Manhattan"}},
+        {"reranker": {"provider": "bogus"}},
+    ):
+        with pytest.raises(ValueError):
+            Config.from_toml_dict({"integrations": payload})
+    distance = Config.from_toml_dict({"integrations": {"vector": {"distance": "cosine"}}})
+    assert distance.integrations.vector.distance == "Cosine"
+
+
+def test_integration_validation_reports_bad_values(tmp_config: Config) -> None:
+    bad = tmp_config.model_copy(deep=True)
+    bad.integrations.enabled = True
+    bad.integrations.embedding.provider = "openai"
+    bad.integrations.embedding.base_url = "ftp://example.invalid"
+    bad.integrations.embedding.dimensions = 1536
+    bad.integrations.embedding.batch_size = 0
+    bad.integrations.vector.backend = "qdrant"
+    bad.integrations.vector.url = "ftp://example.invalid"
+    bad.integrations.vector.vector_size = 768
+    bad.integrations.vector.top_k = 0
+    bad.integrations.reranker.provider = "openai"
+    bad.integrations.reranker.base_url = "not-a-url"
+    bad.integrations.reranker.top_n = 0
+    bad.integrations.graphiti.enabled = True
+    bad.integrations.graphiti.base_url = "ftp://example.invalid"
+    bad.integrations.mem0.enabled = True
+    bad.integrations.mem0.max_items = 0
+    joined = "\n".join(validate_config(bad))
+    assert "embedding.base_url" in joined
+    assert "embedding.batch_size" in joined
+    assert "vector.url" in joined
+    assert "vector.vector_size" in joined
+    assert "vector.top_k" in joined
+    assert "reranker.base_url" in joined
+    assert "reranker.top_n" in joined
+    assert "graphiti.base_url" in joined
+    assert "mem0.max_items" in joined
+
+
+def test_embedding_may_send_guards_private_text() -> None:
+    remote = EmbeddingIntegrationConfig(provider="openai", base_url="https://example.invalid/v1")
+    assert remote.embedding_may_send("shared") is True
+    assert remote.embedding_may_send("personal") is False
+    remote.allow_private_text = True
+    assert remote.embedding_may_send("personal") is True
+    local = EmbeddingIntegrationConfig(provider="hash")
+    assert local.embedding_may_send("personal") is True
+    config = Config.from_toml_dict(
+        {"integrations": {"embedding": {"provider": "openai", "base_url": "https://example.invalid/v1"}}}
+    )
+    assert config.integrations.embedding_may_send("personal") is False
+
+
+def test_redaction_hides_url_credentials_and_keeps_env_names(tmp_config: Config) -> None:
+    cfg = Config.from_toml_dict(
+        {
+            "integrations": {
+                "vector": {
+                    "url": "http://user:secret@127.0.0.1:6333",
+                    "api_key_env": "MY_QDRANT_KEY",
+                }
+            }
+        }
+    )
+    data = redact_config(cfg)
+    assert data["integrations"]["vector"]["url"] == "http://<redacted>@127.0.0.1:6333"
+    assert data["integrations"]["vector"]["api_key_env"] == "MY_QDRANT_KEY"
+    rendered = show_config(cfg)
+    assert "secret" not in rendered
+    assert "MY_QDRANT_KEY" in rendered
+
+
+def test_api_key_values_are_never_stored() -> None:
+    cfg = Config.from_toml_dict(
+        {
+            "integrations": {
+                "embedding": {"provider": "openai", "base_url": "https://example.invalid/v1"},
+                "vector": {"backend": "qdrant"},
+            }
+        }
+    )
+    data = str(cfg.to_toml_dict())
+    for key_name in (
+        "KNOWLAGEMCP_EMBEDDING_API_KEY",
+        "KNOWLAGEMCP_QDRANT_API_KEY",
+        "KNOWLAGEMCP_RERANK_API_KEY",
+        "KNOWLAGEMCP_GRAPHITI_API_KEY",
+        "KNOWLAGEMCP_MEM0_API_KEY",
+    ):
+        assert key_name in data
+    assert "api_key" not in data.replace("api_key_env", "")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        "not-a-url",
+        "ftp://example.invalid",
+        "http://exa mple.invalid",
+        "http://user:secret@example.invalid",
+    ],
+)
+def test_integration_urls_must_be_usable(tmp_config: Config, base_url: str) -> None:
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.embedding.provider = "openai"
+    cfg.integrations.embedding.base_url = base_url
+    joined = "\n".join(validate_config(cfg))
+    assert "integrations.embedding.base_url" in joined
+
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.vector.backend = "qdrant"
+    cfg.integrations.vector.url = base_url
+    joined = "\n".join(validate_config(cfg))
+    assert "integrations.vector.url" in joined
+
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.graphiti.enabled = True
+    cfg.integrations.graphiti.base_url = base_url
+    joined = "\n".join(validate_config(cfg))
+    assert "integrations.graphiti.base_url" in joined
+
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.mem0.enabled = True
+    cfg.integrations.mem0.base_url = base_url
+    joined = "\n".join(validate_config(cfg))
+    assert "integrations.mem0.base_url" in joined

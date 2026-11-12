@@ -132,7 +132,33 @@ strings explaining why that row was returned. A reason appears only when it is
 true for the row. The current vocabulary is `published`, `scope matches
 query`, `exact identifier match`, `fts match`, `evidence: <class>` (for
 example `evidence: reproduced`), `contradiction visible`, `candidate low
-trust`, and `duplicate lineage merged`.
+trust`, `semantic match`, and `duplicate lineage merged`.
+
+### Semantic retrieval metadata and fail-open warnings
+
+`SearchResponse` and `ContextBundle` also carry:
+
+| Field | Meaning |
+|---|---|
+| `retrieval_backend` | `fts5` when only the canonical lexical index answered, `hybrid` when an optional vector index contributed candidates. |
+| `semantic_used` | True when the query was embedded and the vector index was queried. |
+| `reranked` | True when an optional bounded reranker reordered the already authorized result set. |
+| `index_generation` | The derived vector index generation that answered, or null. |
+| `warnings` | Response-level warnings, preserved under byte-budget truncation. |
+
+Semantic retrieval is optional and fail-open. Lexical results remain
+canonical. When the embedding or vector backend is unavailable, misconfigured,
+or returns a dimension mismatch, the response still succeeds with
+`retrieval_backend="fts5"` and a warning such as
+`semantic backend unavailable: BACKEND_UNAVAILABLE`. A configured remote
+embedding provider is an explicit operator decision, so semantic search runs
+even when `integrations.embedding.allow_private_text` is false. Query text is
+sent to the configured embedding endpoint on every semantic search. That
+setting gates indexing instead: personal and private namespace content is only
+embedded and indexed when it is `true`. A vector hit is not trusted for
+authorization: the canonical namespace ACL, scope, lifecycle, and validity
+checks run again against SQLite before it is returned. A reranker can only
+reorder candidates that were already authorized.
 
 ## HTTP bridge API
 

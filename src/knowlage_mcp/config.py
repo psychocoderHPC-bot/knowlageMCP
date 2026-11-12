@@ -18,11 +18,12 @@ import tomllib
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
 
 import platformdirs
 import tomli_w
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator
 
 #: Application directory name used for XDG/platformdirs lookups.
 APP_NAME = "knowlageMCP"
@@ -163,10 +164,175 @@ class LoggingConfig(_Section):
     level: str = "INFO"
 
 
+#: Namespace kinds whose text must not leave the host without explicit consent.
+PRIVATE_NAMESPACE_KINDS = frozenset({"personal", "private", "secret"})
+
+#: Environment variable names are referenced, never their values.
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+_EMBEDDING_PROVIDERS = ("none", "hash", "openai")
+_VECTOR_BACKENDS = ("none", "qdrant")
+_RERANKER_PROVIDERS = ("none", "lexical", "openai")
+_DISTANCES = ("Cosine", "Euclid", "Dot")
+
+
+def _normalize_distance(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().casefold()
+    aliases = {"cosine": "Cosine", "euclid": "Euclid", "euclidean": "Euclid", "dot": "Dot"}
+    return aliases.get(normalized, value)
+
+
+def _is_http_url(value: str) -> bool:
+    """Return whether ``value`` is an absolute http(s) URL with a host.
+
+    Userinfo (``user:password@``) is rejected as well: credentials belong in the
+    named environment variable, never in a URL that could be logged or shown.
+    """
+    if not value or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    if not parsed.netloc or not parsed.hostname:
+        return False
+    return parsed.username is None and parsed.password is None
+
+
+class EmbeddingIntegrationConfig(_Section):
+    """Text embedding provider. ``provider='none'`` performs no work at all."""
+
+    provider: Literal["none", "hash", "openai"] = "none"
+    model: str = "text-embedding-3-small"
+    base_url: str = ""
+    api_key_env: str = "KNOWLAGEMCP_EMBEDDING_API_KEY"
+    dimensions: int = 1536
+    batch_size: int = 16
+    timeout_s: float = 20.0
+    #: Must be true before personal/private text is sent to a remote provider.
+    allow_private_text: bool = False
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    def embedding_may_send(self, namespace_kind: str) -> bool:
+        """Return whether text of ``namespace_kind`` may reach this provider.
+
+        Only a remote ``openai`` provider can export text. Local providers
+        (``none`` and ``hash``) always stay on the host.
+        """
+        if self.provider != "openai":
+            return True
+        return namespace_kind.strip().casefold() not in PRIVATE_NAMESPACE_KINDS or self.allow_private_text
+
+
+class VectorIntegrationConfig(_Section):
+    """Derived vector index. The index is never authoritative for ACL or review."""
+
+    backend: Literal["none", "qdrant"] = "none"
+    url: str = "http://127.0.0.1:6333"
+    api_key_env: str = "KNOWLAGEMCP_QDRANT_API_KEY"
+    collection_prefix: str = "knowlagemcp"
+    vector_size: int = 1536
+    distance: Literal["Cosine", "Euclid", "Dot"] = "Cosine"
+    timeout_s: float = 10.0
+    top_k: int = 40
+    hybrid: bool = True
+
+    @field_validator("backend", mode="before")
+    @classmethod
+    def _normalize_backend(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("distance", mode="before")
+    @classmethod
+    def _normalize_distance_value(cls, value: object) -> object:
+        return _normalize_distance(value)
+
+
+class RerankerIntegrationConfig(_Section):
+    """Optional bounded reranker over already ACL-filtered candidates."""
+
+    provider: Literal["none", "lexical", "openai"] = "none"
+    model: str = "rerank-1"
+    base_url: str = ""
+    api_key_env: str = "KNOWLAGEMCP_RERANK_API_KEY"
+    top_n: int = 20
+    timeout_s: float = 10.0
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+
+class GraphitiIntegrationConfig(_Section):
+    """Temporal graph extraction proposals. Disabled by default."""
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8000"
+    api_key_env: str = "KNOWLAGEMCP_GRAPHITI_API_KEY"
+    timeout_s: float = 20.0
+    max_calls_per_task: int = 4
+
+
+class Mem0IntegrationConfig(_Section):
+    """Conversation-to-memory extraction proposals. Disabled by default."""
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8001"
+    api_key_env: str = "KNOWLAGEMCP_MEM0_API_KEY"
+    timeout_s: float = 20.0
+    max_items: int = 20
+
+
 class IntegrationsConfig(_Section):
-    embeddings: bool = False
+    """Optional semantic/vector layer. Every adapter is off by default."""
+
+    enabled: bool = False
     inference: bool = False
     telemetry: bool = False
+    embedding: EmbeddingIntegrationConfig = Field(default_factory=EmbeddingIntegrationConfig)
+    vector: VectorIntegrationConfig = Field(default_factory=VectorIntegrationConfig)
+    reranker: RerankerIntegrationConfig = Field(default_factory=RerankerIntegrationConfig)
+    graphiti: GraphitiIntegrationConfig = Field(default_factory=GraphitiIntegrationConfig)
+    mem0: Mem0IntegrationConfig = Field(default_factory=Mem0IntegrationConfig)
+
+    def embedding_may_send(self, namespace_kind: str) -> bool:
+        """Delegate to :meth:`EmbeddingIntegrationConfig.embedding_may_send`."""
+        return self.embedding.embedding_may_send(namespace_kind)
+
+
+def _normalize_legacy_integrations(data: dict[str, Any]) -> dict[str, Any]:
+    """Translate the removed boolean ``integrations.embeddings`` key.
+
+    ``false`` selects ``provider='none'`` and ``true`` selects the local
+    ``hash`` provider. An explicit ``integrations.embedding.provider`` always
+    wins, so a partially migrated file keeps its intent.
+    """
+    raw = data.get("integrations")
+    if not isinstance(raw, Mapping):
+        return data
+    integrations = dict(raw)
+    if "embeddings" not in integrations:
+        return data
+    legacy = integrations.pop("embeddings")
+    if not isinstance(legacy, bool):
+        raise ValueError("integrations.embeddings must be a boolean; use [integrations.embedding] instead")
+    embedding = integrations.get("embedding")
+    embedding_table = dict(embedding) if isinstance(embedding, Mapping) else {}
+    if "provider" not in embedding_table:
+        embedding_table["provider"] = "hash" if legacy else "none"
+    integrations["embedding"] = embedding_table
+    data["integrations"] = integrations
+    return data
 
 
 class Config(BaseModel):
@@ -195,7 +361,7 @@ class Config(BaseModel):
 
     @classmethod
     def from_toml_dict(cls, data: Mapping[str, Any]) -> Self:
-        return cls.model_validate(dict(data))
+        return cls.model_validate(_normalize_legacy_integrations(dict(data)))
 
     @classmethod
     def from_toml_text(cls, text: str) -> Self:
@@ -367,6 +533,86 @@ def validate_config(config: Config) -> list[str]:
         config.logging.level.upper() in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"},
         "logging.level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL",
     )
+
+    integrations = config.integrations
+    embedding = integrations.embedding
+    check(embedding.provider in _EMBEDDING_PROVIDERS, "integrations.embedding.provider is not supported")
+    check(embedding.dimensions > 0, "integrations.embedding.dimensions must be positive")
+    check(embedding.batch_size > 0, "integrations.embedding.batch_size must be positive")
+    check(embedding.timeout_s > 0, "integrations.embedding.timeout_s must be positive")
+    check(bool(embedding.model), "integrations.embedding.model must not be empty")
+    check(
+        bool(_ENV_NAME_RE.match(embedding.api_key_env)),
+        "integrations.embedding.api_key_env must be an environment variable name",
+    )
+    if embedding.provider == "openai":
+        check(
+            _is_http_url(embedding.base_url),
+            "integrations.embedding.base_url must be an http(s) URL for provider 'openai'",
+        )
+
+    vector = integrations.vector
+    check(vector.backend in _VECTOR_BACKENDS, "integrations.vector.backend is not supported")
+    check(vector.vector_size > 0, "integrations.vector.vector_size must be positive")
+    check(vector.distance in _DISTANCES, "integrations.vector.distance must be Cosine, Euclid, or Dot")
+    check(vector.timeout_s > 0, "integrations.vector.timeout_s must be positive")
+    check(vector.top_k > 0, "integrations.vector.top_k must be positive")
+    check(bool(vector.collection_prefix), "integrations.vector.collection_prefix must not be empty")
+    check(
+        bool(_ENV_NAME_RE.match(vector.api_key_env)),
+        "integrations.vector.api_key_env must be an environment variable name",
+    )
+    if vector.backend == "qdrant":
+        check(
+            _is_http_url(vector.url),
+            "integrations.vector.url must be an http(s) URL for backend 'qdrant'",
+        )
+        if embedding.provider in {"hash", "openai"}:
+            check(
+                vector.vector_size == embedding.dimensions,
+                "integrations.vector.vector_size must equal integrations.embedding.dimensions",
+            )
+
+    reranker = integrations.reranker
+    check(reranker.provider in _RERANKER_PROVIDERS, "integrations.reranker.provider is not supported")
+    check(reranker.top_n > 0, "integrations.reranker.top_n must be positive")
+    check(reranker.timeout_s > 0, "integrations.reranker.timeout_s must be positive")
+    check(
+        bool(_ENV_NAME_RE.match(reranker.api_key_env)),
+        "integrations.reranker.api_key_env must be an environment variable name",
+    )
+    if reranker.provider == "openai":
+        check(bool(reranker.model), "integrations.reranker.model must not be empty")
+        check(
+            _is_http_url(reranker.base_url),
+            "integrations.reranker.base_url must be an http(s) URL for provider 'openai'",
+        )
+
+    graphiti = integrations.graphiti
+    check(graphiti.timeout_s > 0, "integrations.graphiti.timeout_s must be positive")
+    check(graphiti.max_calls_per_task > 0, "integrations.graphiti.max_calls_per_task must be positive")
+    check(
+        bool(_ENV_NAME_RE.match(graphiti.api_key_env)),
+        "integrations.graphiti.api_key_env must be an environment variable name",
+    )
+    if graphiti.enabled:
+        check(
+            _is_http_url(graphiti.base_url),
+            "integrations.graphiti.base_url must be an http(s) URL when enabled",
+        )
+
+    mem0 = integrations.mem0
+    check(mem0.timeout_s > 0, "integrations.mem0.timeout_s must be positive")
+    check(mem0.max_items > 0, "integrations.mem0.max_items must be positive")
+    check(
+        bool(_ENV_NAME_RE.match(mem0.api_key_env)),
+        "integrations.mem0.api_key_env must be an environment variable name",
+    )
+    if mem0.enabled:
+        check(
+            _is_http_url(mem0.base_url),
+            "integrations.mem0.base_url must be an http(s) URL when enabled",
+        )
     return problems
 
 
@@ -400,12 +646,31 @@ def write_config_atomic(path: Path, config: Config) -> Path:
     return target
 
 
+_URL_USERINFO_RE = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@")
+
+
+def _redact_url_credentials(value: str) -> str:
+    """Mask ``user:password@`` userinfo in an absolute URL-like string."""
+    match = _URL_USERINFO_RE.match(value)
+    if match is None:
+        return value
+    return f"{match.group('scheme')}<redacted>@{value[match.end() :]}"
+
+
+def _is_env_reference(key_text: str) -> bool:
+    """Env-var *names* are safe to display; their values never are."""
+    return key_text.casefold() == "env" or key_text.casefold().endswith("_env")
+
+
 def _redact_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         redacted: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            if any(marker in key_text.casefold() for marker in SECRET_KEY_MARKERS) and not isinstance(
+            if _is_env_reference(key_text):
+                # ``api_key_env`` holds an environment variable name, not a key.
+                redacted[key_text] = item
+            elif any(marker in key_text.casefold() for marker in SECRET_KEY_MARKERS) and not isinstance(
                 item, bool
             ):
                 redacted[key_text] = "<redacted>"
@@ -414,6 +679,8 @@ def _redact_value(value: Any) -> Any:
         return redacted
     if isinstance(value, (list, tuple)):
         return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_url_credentials(value)
     return value
 
 
@@ -483,7 +750,10 @@ _SECTION_COMMENTS = {
     "retrieval": "Search backend selection for this release.",
     "backup": "Retention for scheduled online SQLite backups.",
     "logging": "Log verbosity. Logs never contain session tokens or evidence content.",
-    "integrations": "Optional integrations. All are off by default and never required for core use.",
+    "integrations": (
+        "Optional semantic/vector layer. Disabled by default; canonical data, ACLs, and review "
+        "decisions stay in SQLite. Secrets are referenced by environment variable name only."
+    ),
 }
 
 
@@ -514,18 +784,24 @@ def example_config_text(config: Config | None = None) -> str:
 
 __all__ = [
     "APP_NAME",
+    "PRIVATE_NAMESPACE_KINDS",
     "SECRET_KEY_MARKERS",
     "BackupConfig",
     "Config",
     "DurationSeconds",
+    "EmbeddingIntegrationConfig",
+    "GraphitiIntegrationConfig",
     "IdentityConfig",
     "IntegrationsConfig",
     "LimitsConfig",
     "LoggingConfig",
+    "Mem0IntegrationConfig",
+    "RerankerIntegrationConfig",
     "RetrievalConfig",
     "ReviewConfig",
     "ServerConfig",
     "StorageConfig",
+    "VectorIntegrationConfig",
     "check_config",
     "config_dir",
     "data_dir",

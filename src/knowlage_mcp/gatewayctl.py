@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, __version__
-from .admin_client import AdminClient, AdminError, AdminUnavailable
+from .admin_client import CONFLICT_CODES, AdminClient, AdminError, AdminUnavailable
 from .config import check_config, load_config, show_config
+from .models import ErrorCode, ServiceError
 
 
 def _add_json(parser: argparse.ArgumentParser) -> None:
@@ -146,7 +147,51 @@ def build_parser() -> argparse.ArgumentParser:
     index_sub = index.add_subparsers(dest="index_command", required=True)
     _add_json(index_sub.add_parser("rebuild", help="rebuild the FTS5 index"))
 
+    integrations = sub.add_parser("integrations", help="optional semantic/vector integrations")
+    integrations_sub = integrations.add_subparsers(dest="integrations_command", required=True)
+    _add_json(integrations_sub.add_parser("status", help="show adapter and generation status"))
+    _add_json(integrations_sub.add_parser("probe", help="probe enabled adapter health"))
+    _add_json(integrations_sub.add_parser("reindex", help="rebuild FTS5 and the vector index"))
+    extract = integrations_sub.add_parser("extract", help="store extraction proposals for an entry")
+    extract.add_argument("entry")
+    _add_json(extract)
+    proposals = integrations_sub.add_parser("proposals", help="list advisory extraction proposals")
+    proposals.add_argument("--entry", default=None, help="restrict to one entry id")
+    proposals.add_argument("--state", default="proposed", help="proposal state (default: proposed)")
+    _add_json(proposals)
+    import_memories = integrations_sub.add_parser(
+        "import-memories", help="import conversation memories as candidate proposals"
+    )
+    import_memories.add_argument("file")
+    import_memories.add_argument("--dry-run", action="store_true", help="report without writing")
+    _add_json(import_memories)
+
     return parser
+
+
+def _emit_error(code: str, message: str, retry_after_s: int | None = None) -> None:
+    """Print the machine-readable failure object requested by ``--json``."""
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retry_after_s": retry_after_s,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+    )
+
+
+def _service_exit_code(exc: ServiceError) -> int:
+    if exc.code is ErrorCode.BACKEND_UNAVAILABLE:
+        return 3
+    return 4 if exc.code.value in CONFLICT_CODES else 1
 
 
 def _emit(data: Any, as_json: bool) -> None:
@@ -410,8 +455,102 @@ def _dispatch(args: argparse.Namespace) -> int:
         _emit(client.call("index.rebuild"), args.json)
         return 0
 
+    if command == "integrations":
+        return _dispatch_integrations(args, client)
+
     print(f"unknown command: {command}", file=sys.stderr)
     return 2
+
+
+def _print_integration_status(data: dict[str, Any]) -> None:
+    for key in (
+        "enabled",
+        "embedding",
+        "embedding_available",
+        "vector",
+        "vector_available",
+        "reranker",
+        "reranker_available",
+        "extractor",
+        "extractor_available",
+        "generation",
+    ):
+        print(f"{key:<20} {data.get(key, '-')}")
+    generations = data.get("generations") or []
+    print(f"{'generations':<20} {len(generations)}")
+    for generation in generations:
+        print(
+            f"  {generation.get('generation_id', '-'):<18} "
+            f"{generation.get('state', '-'):<9} "
+            f"{generation.get('backend', '-'):<8} "
+            f"{generation.get('model', '-')} ({generation.get('dimensions', '-')}d)"
+        )
+
+
+def _print_integration_proposals(data: dict[str, Any]) -> None:
+    proposals = data.get("proposals") or []
+    print(f"{'proposals':<20} {len(proposals)}")
+    print(f"{'entry':<20} {data.get('entry_id') or '-'}")
+    print(f"{'state':<20} {data.get('state', '-')}")
+    if not proposals:
+        print("(none)")
+        return
+    print(f"  {'proposal':<18} {'entry':<18} {'extractor':<10} {'relation':<14} {'state':<10} created_at")
+    for proposal in proposals:
+        print(
+            f"  {proposal.get('proposal_id') or '-'!s:<18} "
+            f"{proposal.get('entry_id') or '-'!s:<18} "
+            f"{proposal.get('extractor') or '-'!s:<10} "
+            f"{proposal.get('relation') or '-'!s:<14} "
+            f"{proposal.get('state') or '-'!s:<10} "
+            f"{proposal.get('created_at') or '-'}"
+        )
+
+
+def _dispatch_integrations(args: argparse.Namespace, client: AdminClient) -> int:
+    if args.integrations_command == "status":
+        data = client.call("integrations.status")
+        if args.json:
+            _emit(data, True)
+        else:
+            _print_integration_status(data)
+        return 0
+    if args.integrations_command == "probe":
+        data = client.call("integrations.probe")
+        if args.json:
+            _emit(data, True)
+        else:
+            if not data:
+                print("(disabled)")
+            for role, health in data.items():
+                state = "ok" if health.get("available") else "unavailable"
+                error = health.get("error") or ""
+                print(f"{role:<20} {state:<12} {error}")
+        return 0
+    if args.integrations_command == "reindex":
+        _emit(client.call("integrations.reindex"), args.json)
+        return 0
+    if args.integrations_command == "extract":
+        _emit(client.call("integrations.extract", {"entry_id": args.entry}), args.json)
+        return 0
+    if args.integrations_command == "proposals":
+        data = client.call(
+            "integrations.proposals",
+            {"entry_id": args.entry, "state": args.state},
+        )
+        if args.json:
+            _emit(data, True)
+        else:
+            _print_integration_proposals(data)
+        return 0
+    _emit(
+        client.call(
+            "integrations.import.memories",
+            {"path": args.file, "dry_run": bool(args.dry_run)},
+        ),
+        args.json,
+    )
+    return 0
 
 
 def _dispatch_memory(args: argparse.Namespace, client: AdminClient) -> int:
@@ -498,14 +637,27 @@ def _dispatch_config(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    as_json = bool(getattr(args, "json", False))
     try:
         return _dispatch(args)
     except AdminUnavailable as exc:
-        print(f"gateway unavailable: {exc}", file=sys.stderr)
+        if as_json:
+            _emit_error(ErrorCode.BACKEND_UNAVAILABLE.value, str(exc))
+        else:
+            print(f"gateway unavailable: {exc}", file=sys.stderr)
         return 3
     except AdminError as exc:
-        print(f"{exc.code}: {exc.message}", file=sys.stderr)
+        if as_json:
+            _emit_error(exc.code, exc.message, exc.retry_after_s)
+        else:
+            print(f"{exc.code}: {exc.message}", file=sys.stderr)
         return exc.exit_code
+    except ServiceError as exc:
+        if as_json:
+            _emit_error(exc.code.value, exc.message, exc.retry_after_s)
+        else:
+            print(str(exc), file=sys.stderr)
+        return _service_exit_code(exc)
     except FileNotFoundError as exc:
         print(f"file not found: {exc}", file=sys.stderr)
         return 1

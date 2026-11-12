@@ -240,6 +240,48 @@ CREATE VIRTUAL TABLE entry_fts USING fts5(
 );
 """,
     ),
+    (
+        2,
+        "optional vector generations, derived index state, extraction proposals",
+        """
+CREATE TABLE index_generations (
+    generation_id TEXT PRIMARY KEY,
+    backend TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('building', 'ready', 'stale', 'failed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (backend, model, dimensions, state)
+);
+
+CREATE TABLE entry_index_state (
+    generation_id TEXT NOT NULL REFERENCES index_generations(generation_id) ON DELETE CASCADE,
+    revision_id TEXT NOT NULL REFERENCES entry_revisions(revision_id) ON DELETE CASCADE,
+    backend TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    PRIMARY KEY (generation_id, revision_id)
+);
+
+CREATE TABLE extraction_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    entry_id TEXT NOT NULL REFERENCES entries(entry_id) ON DELETE CASCADE,
+    revision_id TEXT NOT NULL REFERENCES entry_revisions(revision_id) ON DELETE CASCADE,
+    extractor TEXT NOT NULL,
+    relation TEXT,
+    subject TEXT,
+    object TEXT,
+    detail TEXT,
+    state TEXT NOT NULL DEFAULT 'proposed',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_index_generations_backend_state ON index_generations(backend, state);
+CREATE INDEX idx_entry_index_state_revision ON entry_index_state(revision_id);
+CREATE INDEX idx_extraction_proposals_entry_state ON extraction_proposals(entry_id, state);
+""",
+    ),
 ]
 
 MAX_VERSION: int = max(version for version, _, _ in MIGRATIONS)

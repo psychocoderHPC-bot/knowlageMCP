@@ -27,18 +27,28 @@ Markers: `integration` (real transports or processes), `security`
 
 ## Inventory
 
-The current suite has 200 tests:
+The current suite has 364 tests:
 
 | Layer | Tests |
 |---|---|
-| `tests/unit` | 121 |
-| `tests/integration` | 35 |
+| `tests/unit` | 277 |
+| `tests/integration` | 43 |
 | `tests/security` | 40 |
 | `tests/quality` | 4 |
 
 Fixtures such as `tests/fixtures/export_v1.jsonl` are inputs, not tests. The
-counts are the observed result of a full `pytest -q` run; update them when the
-suite changes.
+counts are the observed result of `pytest --collect-only -q`; update them
+when the suite changes. The new integration suites are
+`tests/unit/test_integrations_base.py`, `test_embeddings.py`,
+`test_qdrant.py`, `test_rerank.py`, `test_graphiti.py`, `test_mem0.py`, and
+`test_semantic_retrieval.py` (adapter units over fake transports, hybrid merge
+and ACL re-check, offline fallback), plus
+`tests/integration/test_integrations_admin.py` (gatewayctl admin surface,
+proposals), `tests/integration/test_integrations_http.py` (real-HTTP
+end-to-end hybrid retrieval with a mock Qdrant), and
+`tests/integration/test_integrations_e2e_http.py` (real-HTTP end-to-end
+contract tests over loopback fake Qdrant, embeddings, Graphiti and Mem0
+servers built in `tests/integration/fake_backends.py`).
 
 ## Running
 
@@ -50,7 +60,7 @@ suite changes.
 ```
 
 CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check`,
-`mypy`, and the full `pytest` suite on Python 3.11, 3.12, and 3.13, plus
+`mypy`, and the full `pytest` suite on Python 3.11 through 3.14, plus
 `reuse lint`, a package build, and a wheel-install smoke test in a fresh
 venv outside the tree.
 
@@ -89,6 +99,21 @@ venv outside the tree.
 - Protocol negotiation: the compatibility matrix accepts the current major
   version and newer minors, and rejects older majors, empty strings,
   whitespace, and malformed versions.
+- Integrations: `tests/unit/test_integrations_base.py` exercises the
+  runtime-checkable protocols and registry construction (disabled layer builds
+  only null adapters). `test_embeddings.py` covers batching, the conditional
+  `dimensions` field for `text-embedding-3*` models, count and dimension
+  mismatch errors, API key handling from the named environment variable, and
+  status mapping. `test_qdrant.py` covers collection creation (409 as
+  success), deterministic generation and UUID5 point ids, payload shape,
+  delete and search filters, and health. `test_rerank.py` covers the lexical
+  scorer and the openai-compatible response shapes. `test_graphiti.py` and
+  `test_mem0.py` cover proposal-only semantics, source-role preservation, and
+  the string and item caps. `test_semantic_retrieval.py` proves hybrid merge,
+  that a payload namespace is not trusted for ACL, scope and lifecycle
+  filtering, reranker ordering without additions, fail-open lexical fallback
+  with a response warning, zero HTTP requests while disabled, dimension
+  mismatch handling, restart generation adoption, and the privacy gate.
 
 ## Integration layer
 
@@ -111,6 +136,19 @@ venv outside the tree.
   ledger, and index rebuild.
 - Optional backends disabled or unavailable still permit core reads and
   writes.
+- Integrations: `tests/integration/test_integrations_http.py` runs a real
+  gateway and admin socket with a mock Qdrant behind an in-memory transport:
+  register, record, `integrations reindex`, hybrid search
+  (`retrieval_backend = "hybrid"`, `semantic_used`), and `memory forget`
+  removing the points. `tests/integration/test_integrations_admin.py` covers
+  `integrations status/probe/reindex/extract/proposals/import-memories`
+  through the real admin socket, including that extraction never publishes
+  and that imports land as candidate/unverified with source role preserved.
+  `tests/integration/test_integrations_e2e_http.py` runs the production path
+  over loopback sockets against the fake Qdrant, embeddings, Graphiti, and
+  Mem0 servers in `tests/integration/fake_backends.py`: configuration,
+  registry, real adapters, hybrid retrieval, reranker behavior, extraction,
+  and deletion propagation with no external network access.
 - Concurrency: `tests/integration/test_concurrency.py` runs 50 concurrent
   read/write clients and 50 concurrent readers, checks rate-limit rejection
   with `Retry-After`, and verifies the second-writer lock.
@@ -140,7 +178,10 @@ venv outside the tree.
 
 Measured on Intel Core Ultra 7 255U, 14 threads, Python 3.12.3, SQLite 3.45.1.
 These numbers are the state of this repository on that date; they are
-informational and are never CI gates.
+informational and are never CI gates. The suite was also run locally on
+CPython 3.14.7 with the current dependencies and the same result (201
+passed); 3.14 is locally verified here and CI-confirmed once the matrix job
+passes.
 
 Synthetic corpus (`benchmarks/corpus_v1.json`): 75 entries, 85 labelled
 queries (69 answerable, 12 no-answer, 4 adversarial), and 17 task scenarios,
@@ -220,7 +261,9 @@ with tests or explicit rubrics. Ordinary CI never requires paid API access.
 
 ## Deliberately not tested or claimed
 
-- Live paid-model evaluation in ordinary CI.
+- Live paid-model evaluation in ordinary CI. Integration tests never use
+  external network access: every remote endpoint (Qdrant, embeddings,
+  reranker, Graphiti, Mem0) is faked in-memory.
 - High-availability or multi-host behavior (not designed for).
 - Complete LLM prompt-injection immunity (content screening is advisory, not
   a security boundary).

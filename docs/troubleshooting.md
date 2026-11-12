@@ -7,8 +7,10 @@ SPDX-License-Identifier: ISC
 
 First step for almost every problem: `knowlageMCP-gatewayctl doctor` on the
 host. It checks config validity, permissions, SQLite/FTS5, migration version,
-free space, the listener, the admin socket mode and path, optional backend
-readiness, and host/container connection hints, without leaking secrets.
+free space, the listener, the admin socket mode and path, and
+host/container connection hints, without leaking secrets. Integration adapter
+state is reported by `knowlageMCP-gatewayctl integrations status` and
+`integrations probe`.
 
 | Symptom | Diagnosis | Fix |
 |---|---|---|
@@ -27,3 +29,11 @@ readiness, and host/container connection hints, without leaking secrets.
 | Exit code 3 from gatewayctl | The gateway or its admin socket is not running. | Start the gateway (`systemctl --user start knowlage-mcp-gateway`), then `doctor`. |
 | Exit code 4 from gatewayctl | Conflict or invalid state: stale `expected_revision`, a failed `config check`, or an already-decided enrollment. | Re-read the current state and retry with the fresh value, or fix the config problem `config check` listed. |
 | Agent gets `AUTH_REQUIRED` on a shared bridge | More than one actor is active on the connection and the call omitted `actor_handle`. | Pass the actor handle returned by `register_agent` to every tool call. |
+| Integrations enabled but search reports no semantic results | `integrations status` shows no `ready` generation, so the vector index is unavailable and search stays lexical (fail-open). | Run `knowlageMCP-gatewayctl integrations reindex`, then check `integrations status` for a `ready` generation. |
+| Search results carry a `semantic backend unavailable` warning | The embedding or vector backend is unreachable, unconfigured, or returned a dimension mismatch. The lexical result is still valid. | `knowlageMCP-gatewayctl integrations probe` names the failing role. Check the backend URL, `vector_size`/`dimensions` agreement, and API key environment variable. |
+| Personal namespace content is not found semantically | `integrations.embedding.allow_private_text` is false, so personal/private text was never indexed for a remote provider. | Set `allow_private_text = true` if exporting that text to the configured endpoint is acceptable, then `integrations reindex`. With false, that content is reachable only through lexical search. |
+| Semantic search stopped after changing the embedding model or dimensions | A model or dimension change starts a new generation; the old one is marked `stale` and vectors never mix. | Run `knowlageMCP-gatewayctl integrations reindex` to build the new generation. |
+| Qdrant collection missing or index unavailable after a restart | Restart rehydration adopts the last ready generation only when its model and dimensions still match the configured embedding adapter; the collection may also be absent from Qdrant. | Run `integrations reindex` to recreate the collection and rebuild. `integrations status` lists recorded generations and their state. |
+| Remote embedding endpoint returns 401/403 | The API key environment variable named by `integrations.embedding.api_key_env` is unset, empty, or wrong. The key value is never stored in the config. | Set the variable in the gateway's environment (for example `KNOWLAGEMCP_EMBEDDING_API_KEY`), restart the gateway, and `integrations probe`. |
+| Reranker provider down or returning garbage | The reranker fails open: the merged hybrid result is returned without reranking, with a `semantic backend unavailable` warning. | No action required for correctness. `integrations probe` shows reranker availability; fix the endpoint or set `provider = "lexical"`. |
+| Graphiti/Mem0 extraction produced nothing visible | Proposals are stored with state `proposed` and are never published; nothing appears in search until they go through the normal candidate/review path. | List them with `knowlageMCP-gatewayctl integrations proposals [--entry ENTRY]`. Acceptance is manual via the normal review flow or `integrations import-memories` (candidate/unverified entries). |

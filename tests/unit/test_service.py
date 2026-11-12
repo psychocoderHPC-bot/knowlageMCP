@@ -13,6 +13,7 @@ import pytest
 
 from conftest import ServiceEnv, build_env
 from knowlage_mcp.config import write_config_atomic
+from knowlage_mcp.integrations.base import IntegrationStatus
 from knowlage_mcp.models import (
     EntryPayload,
     ErrorCode,
@@ -133,6 +134,42 @@ def test_doctor_reports_config_mode_and_missing_runtime_assets(
     assert refreshed["config_file"]["ok"] is True
 
 
+def test_doctor_reports_disabled_integrations(env: ServiceEnv) -> None:
+    checks = {check["name"]: check for check in env.service.doctor()["checks"]}
+    assert checks["integrations"] == {"name": "integrations", "ok": True, "detail": "disabled"}
+
+
+def test_doctor_reports_available_integrations(env: ServiceEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    status = IntegrationStatus(
+        enabled=True,
+        embedding="hash",
+        embedding_available=True,
+        vector="qdrant",
+        vector_available=True,
+        reranker="lexical",
+        reranker_available=True,
+        extractor="graphiti",
+        extractor_available=True,
+        generation="gen_0123456789abcdef",
+    )
+    monkeypatch.setattr(env.service.integrations, "status", lambda: status)
+
+    checks = {check["name"]: check for check in env.service.doctor()["checks"]}
+    check = checks["integrations"]
+    assert check["ok"] is True
+    for fragment in (
+        "enabled",
+        "embedding=hash",
+        "vector=qdrant",
+        "reranker=lexical",
+        "extractor=graphiti",
+        "generation=gen_0123456789abcdef",
+    ):
+        assert fragment in check["detail"]
+    assert "http" not in check["detail"]
+    assert "unavailable" not in check["detail"]
+
+
 def test_event_bus_publishes_registration_events(env: ServiceEnv) -> None:
     subscriber = env.service.subscribe()
     env.register(source="event")
@@ -175,6 +212,14 @@ def test_admin_dispatch_command_names(env: ServiceEnv) -> None:
     assert env.service.admin_dispatch("reviews") == []
     assert env.service.admin_dispatch("config.check")["ok"] is True
     assert "[server]" in env.service.admin_dispatch("config.show", {"redacted": True})["config"]
+
+    rebuilt = env.service.admin_dispatch("index.rebuild")
+    assert rebuilt["generation"] is None
+    assert rebuilt["backend"] == "none"
+    assert rebuilt["indexed"] >= 1
+    forwarded = env.service.admin_dispatch("integrations.reindex")
+    assert set(forwarded) == {"generation", "backend", "indexed"}
+    assert forwarded["generation"] is None
 
     smoke = env.service.admin_dispatch("smoke.test")
     assert smoke["ok"] is True

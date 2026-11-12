@@ -63,6 +63,9 @@ def test_expected_tables_and_indices_exist(db: Database) -> None:
         "idempotency_records",
         "deletion_ledger",
         "entry_fts",
+        "index_generations",
+        "entry_index_state",
+        "extraction_proposals",
     } <= tables
     indices = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert {
@@ -73,6 +76,9 @@ def test_expected_tables_and_indices_exist(db: Database) -> None:
         "idx_sources_revision",
         "idx_provenance_from",
         "idx_evidence_revision",
+        "idx_index_generations_backend_state",
+        "idx_entry_index_state_revision",
+        "idx_extraction_proposals_entry_state",
     } <= indices
 
 
@@ -173,3 +179,96 @@ def test_utc_helpers_roundtrip() -> None:
     assert parse_iso(iso(now)) == now
     assert parse_iso(iso(later)) > parse_iso(iso(now))
     assert iso(now).endswith("Z")
+
+
+def test_upgrade_v1_database_to_v2(tmp_path: Path) -> None:
+    path = tmp_path / "v1.sqlite3"
+    database = Database(path)
+    conn = database.connect()
+    conn.executescript(MIGRATIONS[0][2])
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+        (1, iso(utcnow())),
+    )
+    assert database.schema_version() == 1
+    assert database.migrate() == 2
+    assert database.schema_version() == 2
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"index_generations", "entry_index_state", "extraction_proposals"} <= tables
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    database.close()
+
+
+def test_migration_v2_enforces_foreign_keys_and_cascades(db: Database) -> None:
+    now = iso(utcnow())
+    with db.transaction() as conn:
+        conn.execute(
+            "INSERT INTO namespaces (name, kind, created_at) VALUES (?, ?, ?)",
+            ("shared", "shared", now),
+        )
+        conn.execute(
+            "INSERT INTO entries (entry_id, namespace, created_at, created_by_agent_id) VALUES (?, ?, ?, ?)",
+            ("entry-1", "shared", now, "agent-1"),
+        )
+        conn.execute(
+            "INSERT INTO entry_revisions ("
+            "revision_id, entry_id, kind, title, claim, observed_at, author_agent_id, "
+            "author_root_id, source_role, evidence_class, lifecycle, content_hash, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "rev-1",
+                "entry-1",
+                "note",
+                "title",
+                "claim",
+                now,
+                "agent-1",
+                "agent-1",
+                "agent",
+                "unverified",
+                "candidate",
+                "hash",
+                now,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO index_generations "
+            "(generation_id, backend, model, dimensions, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("gen-1", "qdrant", "m", 8, "ready", now, now),
+        )
+        conn.execute(
+            "INSERT INTO entry_index_state (generation_id, revision_id, backend, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("gen-1", "rev-1", "qdrant", "hash", now),
+        )
+        conn.execute(
+            "INSERT INTO extraction_proposals "
+            "(proposal_id, entry_id, revision_id, extractor, relation, subject, object, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("proposal-1", "entry-1", "rev-1", "graphiti", "causes", "a", "b", "detail", now),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO entry_index_state (generation_id, revision_id, backend, content_hash, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("missing", "rev-1", "qdrant", "hash", now),
+        )
+    with db.transaction() as conn:
+        conn.execute("DELETE FROM entry_revisions WHERE revision_id = ?", ("rev-1",))
+    assert conn.execute("SELECT COUNT(*) FROM entry_index_state").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM extraction_proposals").fetchone()[0] == 0
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_v2_generation_states_are_constrained(db: Database) -> None:
+    conn = db.connect()
+    now = iso(utcnow())
+    values = ("gen", "qdrant", "model", 8, "bogus", now, now)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO index_generations "
+            "(generation_id, backend, model, dimensions, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )

@@ -316,6 +316,13 @@ class SearchResponse(_ResponseModel):
     approx_bytes: int = 0
     estimated_tokens: int = 0
     token_estimate_method: str = TOKEN_ESTIMATE_METHOD
+    #: ``fts5`` when only the canonical lexical index answered, ``hybrid`` when
+    #: an optional vector index contributed candidates.
+    retrieval_backend: str = "fts5"
+    semantic_used: bool = False
+    reranked: bool = False
+    index_generation: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 class ReviewView(_ResponseModel):
@@ -475,6 +482,11 @@ class ContextBundle(_ResponseModel):
     truncated: bool = False
     estimated_tokens: int = 0
     token_estimate_method: str = TOKEN_ESTIMATE_METHOD
+    retrieval_backend: str = "fts5"
+    semantic_used: bool = False
+    reranked: bool = False
+    index_generation: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 class TaskOutcome(_ResponseModel):

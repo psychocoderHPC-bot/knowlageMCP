@@ -49,6 +49,17 @@ Three executables, two machines:
   forwards to the gateway over HTTP. It keeps the session credential in
   memory and out of model-visible tool results.
 
+### Optional integration boundary
+
+The optional semantic layer sits beside the canonical store, not inside it.
+SQLite remains canonical: entries, revisions, ACLs, scopes, lifecycle, review
+state, and FTS5 all live there. Qdrant, embeddings, and rerankers are derived
+views that fail open, so an unavailable backend degrades to lexical search.
+Extractors produce proposals only and never publish. After any vector hit the
+service re-applies ACL, scope, and lifecycle from SQLite before showing it.
+The layer is off by default, adds no mandatory dependency, and opens no
+network connection at import or while disabled.
+
 ## What is authenticated, what is not
 
 - **Admin socket**: authenticated by the OS. The socket is mode 0600 in a

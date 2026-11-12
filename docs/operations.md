@@ -220,6 +220,75 @@ knowlageMCP-gatewayctl index rebuild
 Rebuilds the FTS5 index from the canonical entries. Search indices are
 rebuildable; SQLite remains canonical.
 
+## Optional integrations and hybrid retrieval
+
+```bash
+knowlageMCP-gatewayctl integrations status [--json]
+knowlageMCP-gatewayctl integrations probe [--json]
+knowlageMCP-gatewayctl integrations reindex [--json]
+knowlageMCP-gatewayctl integrations extract ENTRY [--json]
+knowlageMCP-gatewayctl integrations proposals [--entry ENTRY] [--state STATE] [--json]
+knowlageMCP-gatewayctl integrations import-memories FILE [--dry-run] [--json]
+```
+
+Every adapter is disabled by default under `[integrations]`. The core continues
+to serve lexical FTS5 search when an adapter is absent or down.
+
+- `status` reports adapter names, availability, and the recorded index
+  generations. It contains no secrets.
+- `probe` performs bounded health checks against the enabled adapters. A
+  disabled integration layer returns an empty map without network work.
+- `reindex` rebuilds FTS5 and, when `integrations.vector.backend` is not
+  `none`, embeds and upserts the current published, disputed, and candidate
+  revisions into a new generation-specific Qdrant collection. The previous
+  ready generation for a different model or dimension set is marked `stale`;
+  the new one is marked `ready`. Embedding model or dimension changes therefore
+  require an explicit reindex and never mix vectors. Personal namespaces are
+  skipped unless the configured embedding provider may send private text
+  (`integrations.embedding.allow_private_text` for a remote provider). After a
+  restart the service adopts the most recent ready generation when its model
+  and dimensions still match the configured embedding adapter, so semantic
+  search resumes without a second reindex; a mismatch keeps the vector index
+  unavailable until an operator reindexes.
+- `extract ENTRY` stores extractor proposals in `extraction_proposals` with
+  state `proposed`. It never creates, publishes, or modifies entries.
+- `proposals` lists advisory extraction proposals, newest first, capped at 50
+  rows. Filter with `--entry` and `--state` (default `proposed`). It accepts or
+  rejects nothing: acceptance goes through the normal candidate and review
+  path.
+- `import-memories FILE` reads JSONL records of
+  `{"role","text","source_role","task"}` and creates new candidate entries
+  through the normal knowledge insert path, preserving the source role,
+  `unverified` evidence, a `mem0` tag, and a `derived_from` provenance edge when
+  the source entry is known. It deduplicates by content hash, never publishes,
+  never overwrites, and caps total proposals at `integrations.mem0.max_items`.
+  `--dry-run` runs extraction and reports counts without writing.
+
+Search stays lexical unless the embedding and vector adapters are enabled and
+healthy. When semantic use succeeds, search and context responses report
+`retrieval_backend="hybrid"`, `semantic_used`, `reranked`, and
+`index_generation`. Failures are fail-open: the lexical result is returned with
+a response warning and no 5xx. A vector hit is re-checked against the canonical
+ACL, scope, lifecycle, and validity rules before display; a reranker can only
+reorder already authorized candidates.
+
+Deletion propagates to the derived index. `memory retract` removes the entry
+from Qdrant after archiving the canonical revision. `memory forget` deletes the
+entry's points and index-state rows after the database purge. Cleanup is
+best-effort: a failure never blocks the canonical operation, and the returned
+dict carries a `warning` when the derived index could not be updated.
+
+### Privacy gate
+
+A configured remote embedding provider is an explicit operator decision, so
+semantic search is allowed even when `allow_private_text = false`. Query text
+is sent to the configured embedding endpoint (`integrations.embedding.base_url`)
+on every semantic search. `integrations.embedding.allow_private_text` gates
+indexing: personal and private namespace content is only embedded and indexed
+when it is `true`. With `false`, that content stays in SQLite and is only
+reachable through lexical search. Local providers (`hash`) and the
+disabled/none provider never leave the host.
+
 ## Limits
 
 Rate and budget limits live in `[limits]` (see

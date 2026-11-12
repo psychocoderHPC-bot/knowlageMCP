@@ -16,6 +16,7 @@ from conftest import free_port
 from knowlage_mcp.bootstrap import run_bootstrap
 from knowlage_mcp.config import load_config
 from knowlage_mcp.db import Database, iso, utcnow
+from knowlage_mcp.migrations import MAX_VERSION
 
 pytestmark = pytest.mark.integration
 
@@ -48,7 +49,10 @@ def test_non_interactive_creates_private_layout(bootstrap_env: dict[str, Any]) -
         assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700
     assert Path(config.storage.database).is_file()
     assert stat.S_IMODE(os.stat(config.storage.database).st_mode) == 0o600
-    assert _rows(config.storage.database, "SELECT MAX(version) AS v FROM schema_migrations")[0]["v"] == 1
+    assert (
+        _rows(config.storage.database, "SELECT MAX(version) AS v FROM schema_migrations")[0]["v"]
+        == MAX_VERSION
+    )
 
 
 def test_rerun_preserves_configuration_and_data(bootstrap_env: dict[str, Any]) -> None:

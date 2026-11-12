@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import importlib.resources
 import json
+import logging
 import os
 import queue
 import shutil
@@ -23,6 +24,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -41,7 +43,9 @@ from .config import (
 from .db import Database, iso
 from .evidence import EvidenceStore
 from .identity import IdentityManager
-from .knowledge import KnowledgeManager, build_entry_detail
+from .integrations.base import MemoryProposal
+from .integrations.registry import IntegrationRegistry
+from .knowledge import KnowledgeManager, build_entry_detail, content_hash, stable_id
 from .migrations import MAX_VERSION
 from .models import (
     ContextBundle,
@@ -49,10 +53,13 @@ from .models import (
     EntryDetail,
     EntryPayload,
     ErrorCode,
+    EvidenceClass,
     Kind,
+    Lifecycle,
     MentorRequest,
     ProposeRevisionRequest,
     ProtocolInfo,
+    ProvenanceRef,
     RecordOutcomeRequest,
     RecordRequest,
     Registration,
@@ -79,6 +86,8 @@ DOCTOR_MIN_FREE_FRACTION = 0.05
 DOCTOR_PROBE_TIMEOUT_S = 0.25
 CONTAINER_HOST = "host.containers.internal"
 TEROK_SHIELD_HINT = "the terok Shield grant localhost:2230 may require task recreation after a network change"
+
+logger = logging.getLogger(__name__)
 
 
 class _DryRunRollback(Exception):
@@ -136,6 +145,7 @@ class KnowledgeService:
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
         config_path: Path | str | None = None,
+        integrations: IntegrationRegistry | None = None,
     ) -> None:
         self.config = config
         self.db = db
@@ -147,11 +157,12 @@ class KnowledgeService:
         self._config_lock = threading.RLock()
         self._event_bus: EventBus | None = None
         self._bus_lock = threading.Lock()
+        self.integrations = integrations if integrations is not None else IntegrationRegistry(config)
         self.identity = IdentityManager(
             config, db, clock=clock, monotonic=monotonic, event_sink=self._publish
         )
         self.knowledge = KnowledgeManager(config, db, evidence, clock=clock, event_sink=self._publish)
-        self.retrieval = RetrievalManager(config, db, clock=clock)
+        self.retrieval = RetrievalManager(config, db, clock=clock, integrations=self.integrations)
         self.review = ReviewManager(config, db, clock=clock, event_sink=self._publish)
         self.backup = BackupManager(config, db, evidence, clock=clock)
 
@@ -181,11 +192,14 @@ class KnowledgeService:
         return now_from(self._clock)
 
     def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self.integrations.close()
         self.db.close()
 
     # -- startup ---------------------------------------------------------
     def bootstrap(self) -> dict[str, Any]:
         version = self.db.migrate()
+        self._adopt_vector_generation()
         counts = self.identity.startup_reset()
         return {
             "schema_version": version,
@@ -195,6 +209,39 @@ class KnowledgeService:
             ],
             **counts,
         }
+
+    def _adopt_vector_generation(self) -> None:
+        """Re-attach the derived vector index to the last ready generation.
+
+        A restart must not leave semantic search disabled until an operator
+        reindexes. Adoption is only safe when the recorded model and dimension
+        set match the configured embedding adapter; a mismatch means the old
+        vectors are not comparable, so a reindex is required.
+        """
+        integrations = self.config.integrations
+        vector_config = integrations.vector
+        if not integrations.enabled or vector_config.backend == "none":
+            return
+        vector = self.integrations.vector
+        row = (
+            self.db.connect()
+            .execute(
+                "SELECT generation_id, model, dimensions FROM index_generations "
+                "WHERE state = 'ready' AND backend = ? ORDER BY created_at DESC LIMIT 1",
+                (vector.name,),
+            )
+            .fetchone()
+        )
+        if row is None:
+            return
+        embedding = self.integrations.embedding
+        if str(row["model"]) != embedding.model or int(row["dimensions"]) != int(embedding.dimensions):
+            logger.warning(
+                "vector generation %s not adopted: embedding model or dimensions differ; reindex required",
+                row["generation_id"],
+            )
+            return
+        vector.adopt_generation(str(row["generation_id"]))
 
     # -- identity --------------------------------------------------------
     def register(
@@ -268,10 +315,14 @@ class KnowledgeService:
 
     # -- knowledge -------------------------------------------------------
     def record(self, session: SessionInfo, request: RecordRequest) -> WriteResult:
-        return self.knowledge.record(session, request)
+        result = self.knowledge.record(session, request)
+        self.retrieval.index_entry_revision(result.entry.entry_id, result.entry.revision_id)
+        return result
 
     def propose_revision(self, session: SessionInfo, request: ProposeRevisionRequest) -> WriteResult:
-        return self.knowledge.propose_revision(session, request)
+        result = self.knowledge.propose_revision(session, request)
+        self.retrieval.index_entry_revision(result.entry.entry_id, result.entry.revision_id)
+        return result
 
     def record_outcome(self, session: SessionInfo, request: RecordOutcomeRequest) -> TaskOutcome:
         return self.knowledge.record_outcome(session, request)
@@ -332,7 +383,10 @@ class KnowledgeService:
         return self.review.review_next(session, resolved)
 
     def submit_review(self, session: SessionInfo, request: SubmitReviewRequest) -> SubmitReviewResult:
-        return self.review.submit_review(session, request)
+        result = self.review.submit_review(session, request)
+        if result.published:
+            self.retrieval.index_entry_revision(result.entry_id, result.revision_id)
+        return result
 
     # -- admin: status and diagnostics ----------------------------------
     def status(self) -> dict[str, Any]:
@@ -383,6 +437,29 @@ class KnowledgeService:
 
         problems = validate_config(self.config)
         add("config", not problems, "; ".join(problems) if problems else "valid")
+
+        try:
+            integration_status = self.integrations.status()
+        except Exception:
+            add("integrations", False, "status unavailable")
+        else:
+            if not integration_status.enabled:
+                add("integrations", True, "disabled")
+            else:
+                roles = (
+                    ("embedding", integration_status.embedding, integration_status.embedding_available),
+                    ("vector", integration_status.vector, integration_status.vector_available),
+                    ("reranker", integration_status.reranker, integration_status.reranker_available),
+                    ("extractor", integration_status.extractor, integration_status.extractor_available),
+                )
+                names = " ".join(f"{role}={name}" for role, name, _ in roles)
+                detail = f"enabled; {names}"
+                if integration_status.generation:
+                    detail += f"; generation={integration_status.generation}"
+                unavailable = [role for role, name, available in roles if name != "null" and not available]
+                if unavailable:
+                    detail += f"; unavailable: {', '.join(unavailable)}"
+                add("integrations", not unavailable, detail)
 
         config_file = self._config_path or (config_dir() / "config.toml")
         try:
@@ -626,10 +703,19 @@ class KnowledgeService:
         return self.knowledge.memory_correct(entry_id, expected_revision, text)
 
     def memory_retract(self, entry_id: str, reason: str) -> dict[str, Any]:
-        return self.knowledge.memory_retract(entry_id, reason)
+        result = self.knowledge.memory_retract(entry_id, reason)
+        warning = self.retrieval.remove_from_vector(entry_id)
+        if warning is not None:
+            result = {**result, "warning": warning}
+        return result
 
     def memory_forget(self, entry_id: str, dry_run: bool = False) -> dict[str, Any]:
-        return self.knowledge.memory_forget(entry_id, dry_run)
+        result = self.knowledge.memory_forget(entry_id, dry_run)
+        if not bool(result.get("dry_run")) and bool(result.get("forgotten")):
+            warning = self.retrieval.remove_from_vector(entry_id)
+            if warning is not None:
+                result = {**result, "warning": warning}
+        return result
 
     # -- admin: backup ---------------------------------------------------
     def backup_create(self) -> dict[str, Any]:
@@ -661,6 +747,293 @@ class KnowledgeService:
     # -- admin: index and config ----------------------------------------
     def index_rebuild(self) -> dict[str, Any]:
         return self.retrieval.index_rebuild()
+
+    # -- admin: optional integrations -----------------------------------
+    def integrations_status(self) -> dict[str, Any]:
+        data = asdict(self.integrations.status())
+        rows = (
+            self.db.connect()
+            .execute(
+                "SELECT generation_id, backend, model, dimensions, state, created_at, updated_at "
+                "FROM index_generations ORDER BY created_at DESC"
+            )
+            .fetchall()
+        )
+        data["generations"] = [dict(row) for row in rows]
+        return data
+
+    def integrations_probe(self) -> dict[str, dict[str, Any]]:
+        return self.integrations.probe()
+
+    def integrations_proposals(
+        self,
+        entry_id: str | None = None,
+        state: str = "proposed",
+    ) -> dict[str, Any]:
+        """Return advisory extraction proposals. Read-only; nothing is audited."""
+        normalized_state = state.strip() or "proposed"
+        clauses = ["state = ?"]
+        parameters: list[Any] = [normalized_state]
+        if entry_id is not None:
+            clauses.append("entry_id = ?")
+            parameters.append(entry_id)
+        rows = (
+            self.db.connect()
+            .execute(
+                "SELECT proposal_id, entry_id, revision_id, extractor, relation, subject, object, "
+                "detail, state, created_at FROM extraction_proposals "
+                f"WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 50",
+                parameters,
+            )
+            .fetchall()
+        )
+        return {
+            "entry_id": entry_id,
+            "state": normalized_state,
+            "proposals": [dict(row) for row in rows],
+        }
+
+    def integrations_reindex(self) -> dict[str, Any]:
+        return self.index_rebuild()
+
+    def integrations_extract(self, entry_id: str) -> dict[str, Any]:
+        conn = self.db.connect()
+        entry = conn.execute("SELECT * FROM entries WHERE entry_id = ?", (entry_id,)).fetchone()
+        if entry is None:
+            raise ServiceError(ErrorCode.NOT_FOUND, "entry not found")
+        revision_id = entry["current_revision_id"]
+        if revision_id is None:
+            raise ServiceError(ErrorCode.CONFLICT, "entry has no current revision")
+        revision = conn.execute(
+            "SELECT * FROM entry_revisions WHERE revision_id = ?", (str(revision_id),)
+        ).fetchone()
+        if revision is None:
+            raise ServiceError(ErrorCode.NOT_FOUND, "revision not found")
+        sources = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM sources WHERE revision_id = ? ORDER BY created_at", (str(revision_id),)
+            ).fetchall()
+        ]
+        extractor = self.integrations.extractor
+        if not extractor.available:
+            return {
+                "entry_id": entry_id,
+                "revision_id": str(revision_id),
+                "extractor": extractor.name,
+                "available": False,
+                "proposals": [],
+            }
+        proposals = extractor.extract(
+            str(revision["claim"]),
+            task=str(revision["title"]),
+            sources=sources,
+        )
+        stored: list[MemoryProposal] = []
+        with self.db.transaction() as tx:
+            for proposal in proposals:
+                proposal_id = stable_id(
+                    "prp",
+                    entry_id,
+                    str(revision_id),
+                    proposal.kind,
+                    proposal.title,
+                    proposal.claim,
+                )
+                tx.execute(
+                    "INSERT OR IGNORE INTO extraction_proposals "
+                    "(proposal_id, entry_id, revision_id, extractor, relation, subject, object, "
+                    "detail, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+                    (
+                        proposal_id,
+                        entry_id,
+                        str(revision_id),
+                        extractor.name,
+                        proposal.relation,
+                        proposal.subject,
+                        proposal.object,
+                        proposal.detail,
+                        iso(self._now()),
+                    ),
+                )
+                stored.append(proposal)
+            event = audit(
+                tx,
+                self._now(),
+                actor_agent_id=None,
+                action="integrations.extract",
+                object_type="entry",
+                object_id=entry_id,
+                details={"revision_id": str(revision_id), "proposals": len(stored)},
+            )
+        self._publish(event)
+        return {
+            "entry_id": entry_id,
+            "revision_id": str(revision_id),
+            "extractor": extractor.name,
+            "available": True,
+            "proposals": [asdict(proposal) for proposal in stored],
+        }
+
+    @staticmethod
+    def _import_source_revision(tx: sqlite3.Connection, record: Mapping[str, Any]) -> str | None:
+        revision_id = record.get("source_revision_id")
+        if isinstance(revision_id, str) and revision_id:
+            row = tx.execute("SELECT 1 FROM entry_revisions WHERE revision_id = ?", (revision_id,)).fetchone()
+            return revision_id if row is not None else None
+        entry_id = record.get("source_entry_id")
+        if isinstance(entry_id, str) and entry_id:
+            row = tx.execute(
+                "SELECT current_revision_id FROM entries WHERE entry_id = ?", (entry_id,)
+            ).fetchone()
+            if row is not None and row["current_revision_id"]:
+                return str(row["current_revision_id"])
+        return None
+
+    def integrations_import_memories(
+        self,
+        path: str | Path,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        source = Path(path)
+        if not source.is_file():
+            raise self._json_error("import path must be an existing file")
+        records: list[dict[str, Any]] = []
+        malformed = 0
+        try:
+            with source.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    parsed = json.loads(text)
+                    if not isinstance(parsed, dict):
+                        malformed += 1
+                        continue
+                    records.append(parsed)
+        except (OSError, ValueError) as exc:
+            raise self._json_error("memories import file is not valid JSONL") from exc
+
+        namespace = self.config.identity.initial_namespace
+        extractor = self.integrations.extractor
+        max_items = max(1, int(self.config.integrations.mem0.max_items))
+        counts: dict[str, Any] = {
+            "path": str(source),
+            "records": len(records),
+            "proposals": 0,
+            "created": 0,
+            "skipped": 0,
+            "malformed": malformed,
+            "dry_run": bool(dry_run),
+            "extractor": extractor.name,
+        }
+        if not extractor.available:
+            counts["available"] = False
+            return counts
+
+        pending: list[tuple[MemoryProposal, Mapping[str, Any]]] = []
+        for record in records:
+            if counts["proposals"] >= max_items:
+                break
+            text = str(record.get("text") or "").strip()
+            if not text:
+                counts["malformed"] += 1
+                continue
+            source_role = str(record.get("source_role") or record.get("role") or "unknown")
+            task = record.get("task")
+            found = extractor.extract(text, task=str(task) if task else None, sources=[])
+            for proposal in found:
+                if counts["proposals"] >= max_items:
+                    break
+                counts["proposals"] += 1
+                pending.append((proposal, {**record, "source_role": source_role}))
+
+        if dry_run:
+            return counts
+
+        at = self._now()
+        indexed: list[tuple[str, str]] = []
+        with self.db.transaction() as tx:
+            if namespace_kind(tx, namespace) is None:
+                raise self._json_error("initial namespace does not exist")
+            for proposal, source_record in pending:
+                claim = proposal.claim.strip()
+                if not claim:
+                    counts["skipped"] += 1
+                    continue
+                try:
+                    kind = Kind(proposal.kind)
+                except ValueError:
+                    kind = Kind.OBSERVATION
+                title = proposal.title.strip() or " ".join(claim.split())[:120]
+                tags = tuple(dict.fromkeys((*proposal.tags, "mem0")))
+                scope = Scope.model_validate(proposal.scope or {})
+                source_revision = self._import_source_revision(tx, source_record)
+                provenance = (
+                    (ProvenanceRef(to_revision_id=source_revision, relation="derived_from"),)
+                    if source_revision is not None
+                    else ()
+                )
+                payload = EntryPayload(
+                    kind=kind,
+                    title=title,
+                    claim=claim,
+                    conditions=proposal.conditions,
+                    expected_result=proposal.expected_result,
+                    limitations=proposal.limitations,
+                    tags=tags,
+                    scope=scope,
+                    source_role=str(source_record.get("source_role") or proposal.source_role or "unknown"),
+                    evidence_class=EvidenceClass.UNVERIFIED,
+                    lifecycle=Lifecycle.CANDIDATE,
+                    provenance=provenance,
+                )
+                self.knowledge._validate_payload(payload)
+                digest = content_hash(namespace, kind, title, claim, scope)
+                existing = self.knowledge._dedupe_lookup(tx, namespace, digest)
+                if existing is not None:
+                    counts["skipped"] += 1
+                    continue
+                entry_id = stable_id("ent", namespace, digest, iso(at), str(len(indexed)))
+                tx.execute(
+                    "INSERT INTO entries (entry_id, namespace, created_at, "
+                    "created_by_agent_id, current_revision_id) VALUES (?, ?, ?, ?, NULL)",
+                    (entry_id, namespace, iso(at), f"extractor:{extractor.name}"),
+                )
+                revision_id = self.knowledge._insert_revision(
+                    tx,
+                    entry_id=entry_id,
+                    prev_revision_id=None,
+                    namespace=namespace,
+                    payload=payload,
+                    author_agent_id=f"extractor:{extractor.name}",
+                    author_root_id=f"extractor:{extractor.name}",
+                    lifecycle=Lifecycle.CANDIDATE,
+                    evidence_class=EvidenceClass.UNVERIFIED,
+                    last_verified_at=None,
+                    digest=digest,
+                    at=at,
+                )
+                tx.execute(
+                    "UPDATE entries SET current_revision_id = ? WHERE entry_id = ?",
+                    (revision_id, entry_id),
+                )
+                self.knowledge._enqueue_review(tx, entry_id, revision_id, at)
+                indexed.append((entry_id, revision_id))
+                counts["created"] += 1
+            event = audit(
+                tx,
+                at,
+                actor_agent_id=None,
+                action="integrations.import.memories",
+                object_type="memories",
+                object_id=str(source),
+                details={**counts, "dry_run": False},
+            )
+        self._publish(event)
+        for entry_id, revision_id in indexed:
+            self.retrieval.index_entry_revision(entry_id, revision_id)
+        return counts
 
     def config_check(self) -> dict[str, Any]:
         problems = validate_config(self.config)
@@ -1268,6 +1641,13 @@ class KnowledgeService:
             "memory.correct": "memory.correct",
             "memory.retract": "memory.retract",
             "memory.forget": "memory.forget",
+            "integrations.status": "integrations.status",
+            "integrations.probe": "integrations.probe",
+            "integrations.reindex": "integrations.reindex",
+            "integrations.extract": "integrations.extract",
+            "integrations.proposals": "integrations.proposals",
+            "integrations.import.memories": "integrations.import.memories",
+            "integrations.import-memories": "integrations.import.memories",
         }
         name = aliases.get(normalized, normalized)
 
@@ -1416,6 +1796,28 @@ class KnowledgeService:
             if not value:
                 raise self._json_error("path is required")
             return self.import_jsonl(str(value), bool(arguments.get("dry_run", False)))
+        if name == "integrations.status":
+            return self.integrations_status()
+        if name == "integrations.probe":
+            return self.integrations_probe()
+        if name == "integrations.reindex":
+            return self.integrations_reindex()
+        if name == "integrations.extract":
+            value = arguments.get("entry_id") or arguments.get("entry")
+            if not value:
+                raise self._json_error("entry_id is required")
+            return self.integrations_extract(str(value))
+        if name == "integrations.proposals":
+            value = arguments.get("entry_id") or arguments.get("entry")
+            return self.integrations_proposals(
+                str(value) if value else None,
+                str(arguments.get("state") or "proposed"),
+            )
+        if name == "integrations.import.memories":
+            value = arguments.get("path") or arguments.get("file")
+            if not value:
+                raise self._json_error("path is required")
+            return self.integrations_import_memories(str(value), bool(arguments.get("dry_run", False)))
         raise ServiceError(ErrorCode.INVALID_ARGUMENT, f"unknown admin command: {cmd}")
 
     # -- compatibility aliases ------------------------------------------
