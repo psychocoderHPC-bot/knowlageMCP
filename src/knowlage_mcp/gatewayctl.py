@@ -152,8 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(integrations_sub.add_parser("status", help="show adapter and generation status"))
     _add_json(integrations_sub.add_parser("probe", help="probe enabled adapter health"))
     _add_json(integrations_sub.add_parser("reindex", help="rebuild FTS5 and the vector index"))
-    extract = integrations_sub.add_parser("extract", help="store extraction proposals for an entry")
-    extract.add_argument("entry")
+    extract = integrations_sub.add_parser(
+        "extract", help="store extraction proposals for one or more entries"
+    )
+    extract.add_argument("entry", nargs="+")
     _add_json(extract)
     proposals = integrations_sub.add_parser("proposals", help="list advisory extraction proposals")
     proposals.add_argument("--entry", default=None, help="restrict to one entry id")
@@ -531,7 +533,23 @@ def _dispatch_integrations(args: argparse.Namespace, client: AdminClient) -> int
         _emit(client.call("integrations.reindex"), args.json)
         return 0
     if args.integrations_command == "extract":
-        _emit(client.call("integrations.extract", {"entry_id": args.entry}), args.json)
+        if len(args.entry) == 1:
+            data = client.call("integrations.extract", {"entry_id": args.entry[0]})
+        else:
+            data = client.call("integrations.extract", {"entry_ids": list(args.entry)})
+        if args.json:
+            _emit(data, True)
+        else:
+            for entry in data.get("entries", []):
+                state = "available" if entry.get("available") else "unavailable"
+                print(
+                    f"{entry.get('entry_id') or '-'!s:<18} "
+                    f"{entry.get('extractor') or '-'!s:<10} "
+                    f"{state:<12} "
+                    f"proposals={entry.get('proposals', 0)} "
+                    f"stored={entry.get('stored', 0)}"
+                )
+            print(f"calls={data.get('calls', 0)} cap={data.get('cap', '-')}")
         return 0
     if args.integrations_command == "proposals":
         data = client.call(

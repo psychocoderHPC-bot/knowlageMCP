@@ -14,6 +14,7 @@ Keep a Changelog and the project uses Semantic Versioning.
 
 - Host-canonical SQLite service with WAL mode, foreign keys, ordered
   migrations, an FTS5 index, and a single-writer lock.
+- Python 3.14 support alongside 3.11, 3.12, and 3.13.
 - Configuration and bootstrap wizard with interactive and non-interactive
   modes, XDG path resolution, atomic writes, validation, secret redaction, and
   a systemd user unit.

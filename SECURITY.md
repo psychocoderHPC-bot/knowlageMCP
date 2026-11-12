@@ -44,6 +44,28 @@ written to logs. Uploaded evidence is scanned for common credential patterns and
 redacted before storage. Redaction is best effort, never a guarantee: do not
 upload secrets in the first place.
 
+## Optional integration egress
+
+Every integration adapter is off by default; with `integrations.enabled =
+false` the service makes no integration network I/O. When an operator enables
+the layer and configures an adapter, egress is limited to the configured
+endpoint:
+
+- Query text is sent to the configured embedding endpoint on every semantic
+  search.
+- Entry titles and claims are sent to that endpoint during indexing.
+- Entry claims are sent to the configured Graphiti endpoint by explicit
+  extraction commands.
+- Conversation text is sent to the configured Mem0 endpoint by explicit
+  extraction commands.
+
+Personal and private namespace content is indexed only when
+`integrations.embedding.allow_private_text = true`. API keys are read from the
+named environment variables at request time and are never stored in config
+files or written to logs. Admin integration commands are available only over
+the operator Unix socket. Extractors emit proposals only; they cannot publish
+or overwrite canonical entries.
+
 ## Dependency vulnerability policy
 
 CI runs `pip-audit` against the installed dependency set in an advisory job.

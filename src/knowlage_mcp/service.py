@@ -23,7 +23,7 @@ import stat
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -79,6 +79,10 @@ from .models import (
 from .policy import audit, namespace_kind, now_from, require_namespace
 from .retrieval import RetrievalManager
 from .review import ReviewManager
+
+#: Bounds for operator-initiated JSONL imports.
+MAX_IMPORT_BYTES = 32 * 1024 * 1024
+MAX_IMPORT_RECORDS = 50_000
 
 #: Doctor thresholds. A warning is informational for operators, never a gate.
 DOCTOR_MIN_FREE_BYTES = 1024**3
@@ -796,84 +800,137 @@ class KnowledgeService:
     def integrations_reindex(self) -> dict[str, Any]:
         return self.index_rebuild()
 
-    def integrations_extract(self, entry_id: str) -> dict[str, Any]:
-        conn = self.db.connect()
-        entry = conn.execute("SELECT * FROM entries WHERE entry_id = ?", (entry_id,)).fetchone()
-        if entry is None:
-            raise ServiceError(ErrorCode.NOT_FOUND, "entry not found")
-        revision_id = entry["current_revision_id"]
-        if revision_id is None:
-            raise ServiceError(ErrorCode.CONFLICT, "entry has no current revision")
-        revision = conn.execute(
-            "SELECT * FROM entry_revisions WHERE revision_id = ?", (str(revision_id),)
-        ).fetchone()
-        if revision is None:
-            raise ServiceError(ErrorCode.NOT_FOUND, "revision not found")
-        sources = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM sources WHERE revision_id = ? ORDER BY created_at", (str(revision_id),)
-            ).fetchall()
-        ]
+    def integrations_extract(self, entry_ids: Sequence[str] | str) -> dict[str, Any]:
+        requested = [entry_ids] if isinstance(entry_ids, str) else [str(entry_id) for entry_id in entry_ids]
+        unique = list(dict.fromkeys(entry_id for entry_id in requested if entry_id))
+        if not unique:
+            raise ServiceError(ErrorCode.INVALID_ARGUMENT, "at least one entry_id is required")
+        cap = int(self.config.integrations.graphiti.max_calls_per_task)
+        if len(unique) > cap:
+            raise ServiceError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"integrations.graphiti.max_calls_per_task cap ({cap}) exceeded: "
+                f"{len(unique)} entry ids requested",
+            )
         extractor = self.integrations.extractor
-        if not extractor.available:
-            return {
-                "entry_id": entry_id,
-                "revision_id": str(revision_id),
-                "extractor": extractor.name,
-                "available": False,
-                "proposals": [],
-            }
-        proposals = extractor.extract(
-            str(revision["claim"]),
-            task=str(revision["title"]),
-            sources=sources,
-        )
-        stored: list[MemoryProposal] = []
-        with self.db.transaction() as tx:
-            for proposal in proposals:
-                proposal_id = stable_id(
-                    "prp",
-                    entry_id,
-                    str(revision_id),
-                    proposal.kind,
-                    proposal.title,
-                    proposal.claim,
+        if not extractor.available and extractor.name != "null":
+            raise ServiceError(
+                ErrorCode.BACKEND_UNAVAILABLE,
+                f"extractor {extractor.name!r} is configured but unavailable",
+            )
+
+        conn = self.db.connect()
+        resolved: list[tuple[str, str, sqlite3.Row, list[dict[str, Any]]]] = []
+        for entry_id in unique:
+            entry = conn.execute("SELECT * FROM entries WHERE entry_id = ?", (entry_id,)).fetchone()
+            if entry is None:
+                raise ServiceError(ErrorCode.NOT_FOUND, "entry not found")
+            revision_id = entry["current_revision_id"]
+            if revision_id is None:
+                raise ServiceError(ErrorCode.CONFLICT, "entry has no current revision")
+            revision = conn.execute(
+                "SELECT * FROM entry_revisions WHERE revision_id = ?", (str(revision_id),)
+            ).fetchone()
+            if revision is None:
+                raise ServiceError(ErrorCode.NOT_FOUND, "revision not found")
+            sources = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM sources WHERE revision_id = ? ORDER BY created_at",
+                    (str(revision_id),),
+                ).fetchall()
+            ]
+            resolved.append((entry_id, str(revision_id), revision, sources))
+
+        rows: list[dict[str, Any]] = []
+        stored_by_entry: dict[str, list[MemoryProposal]] = {}
+        calls = 0
+        for entry_id, revision_id, revision, sources in resolved:
+            if not extractor.available:
+                rows.append(
+                    {
+                        "entry_id": entry_id,
+                        "revision_id": str(revision_id),
+                        "extractor": extractor.name,
+                        "available": False,
+                        "proposals": 0,
+                        "stored": 0,
+                    }
                 )
-                tx.execute(
-                    "INSERT OR IGNORE INTO extraction_proposals "
-                    "(proposal_id, entry_id, revision_id, extractor, relation, subject, object, "
-                    "detail, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
-                    (
-                        proposal_id,
+                stored_by_entry[entry_id] = []
+                continue
+            proposals = extractor.extract(
+                str(revision["claim"]),
+                task=str(revision["title"]),
+                sources=sources,
+            )
+            calls += 1
+            stored: list[MemoryProposal] = []
+            inserted = 0
+            with self.db.transaction() as tx:
+                for proposal in proposals:
+                    proposal_id = stable_id(
+                        "prp",
                         entry_id,
                         str(revision_id),
-                        extractor.name,
-                        proposal.relation,
-                        proposal.subject,
-                        proposal.object,
-                        proposal.detail,
-                        iso(self._now()),
-                    ),
+                        proposal.kind,
+                        proposal.title,
+                        proposal.claim,
+                    )
+                    cursor = tx.execute(
+                        "INSERT OR IGNORE INTO extraction_proposals "
+                        "(proposal_id, entry_id, revision_id, extractor, relation, subject, object, "
+                        "detail, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)",
+                        (
+                            proposal_id,
+                            entry_id,
+                            str(revision_id),
+                            extractor.name,
+                            proposal.relation,
+                            proposal.subject,
+                            proposal.object,
+                            proposal.detail,
+                            iso(self._now()),
+                        ),
+                    )
+                    stored.append(proposal)
+                    if cursor.rowcount:
+                        inserted += 1
+                event = audit(
+                    tx,
+                    self._now(),
+                    actor_agent_id=None,
+                    action="integrations.extract",
+                    object_type="entry",
+                    object_id=entry_id,
+                    details={"revision_id": str(revision_id), "proposals": len(stored)},
                 )
-                stored.append(proposal)
-            event = audit(
-                tx,
-                self._now(),
-                actor_agent_id=None,
-                action="integrations.extract",
-                object_type="entry",
-                object_id=entry_id,
-                details={"revision_id": str(revision_id), "proposals": len(stored)},
+            self._publish(event)
+            stored_by_entry[entry_id] = stored
+            rows.append(
+                {
+                    "entry_id": entry_id,
+                    "revision_id": str(revision_id),
+                    "extractor": extractor.name,
+                    "available": True,
+                    "proposals": len(proposals),
+                    "stored": inserted,
+                }
             )
-        self._publish(event)
-        return {
-            "entry_id": entry_id,
-            "revision_id": str(revision_id),
-            "extractor": extractor.name,
-            "available": True,
-            "proposals": [asdict(proposal) for proposal in stored],
-        }
+
+        result: dict[str, Any] = {"entries": rows, "calls": calls, "cap": cap}
+        if len(unique) == 1:
+            single = rows[0]
+            result.update(
+                {
+                    "entry_id": single["entry_id"],
+                    "revision_id": single["revision_id"],
+                    "extractor": single["extractor"],
+                    "available": single["available"],
+                    "proposals": [asdict(proposal) for proposal in stored_by_entry.get(unique[0], [])],
+                }
+            )
+        return result
 
     @staticmethod
     def _import_source_revision(tx: sqlite3.Connection, record: Mapping[str, Any]) -> str | None:
@@ -898,6 +955,12 @@ class KnowledgeService:
         source = Path(path)
         if not source.is_file():
             raise self._json_error("import path must be an existing file")
+        if source.stat().st_size > MAX_IMPORT_BYTES:
+            raise ServiceError(
+                ErrorCode.BUDGET_EXCEEDED,
+                "memories import file exceeds the 32 MiB bound",
+                details={"max_bytes": MAX_IMPORT_BYTES},
+            )
         records: list[dict[str, Any]] = []
         malformed = 0
         try:
@@ -906,6 +969,12 @@ class KnowledgeService:
                     text = line.strip()
                     if not text:
                         continue
+                    if len(records) + malformed + 1 > MAX_IMPORT_RECORDS:
+                        raise ServiceError(
+                            ErrorCode.BUDGET_EXCEEDED,
+                            "memories import file exceeds the 50000 record bound",
+                            details={"max_records": MAX_IMPORT_RECORDS},
+                        )
                     parsed = json.loads(text)
                     if not isinstance(parsed, dict):
                         malformed += 1
@@ -924,16 +993,22 @@ class KnowledgeService:
             "created": 0,
             "skipped": 0,
             "malformed": malformed,
+            "calls": 0,
             "dry_run": bool(dry_run),
             "extractor": extractor.name,
         }
         if not extractor.available:
+            if extractor.name != "null":
+                raise ServiceError(
+                    ErrorCode.BACKEND_UNAVAILABLE,
+                    f"extractor {extractor.name!r} is configured but unavailable",
+                )
             counts["available"] = False
             return counts
 
         pending: list[tuple[MemoryProposal, Mapping[str, Any]]] = []
         for record in records:
-            if counts["proposals"] >= max_items:
+            if counts["calls"] >= max_items:
                 break
             text = str(record.get("text") or "").strip()
             if not text:
@@ -941,7 +1016,12 @@ class KnowledgeService:
                 continue
             source_role = str(record.get("source_role") or record.get("role") or "unknown")
             task = record.get("task")
-            found = extractor.extract(text, task=str(task) if task else None, sources=[])
+            counts["calls"] += 1
+            found = extractor.extract(
+                text,
+                task=str(task) if task else None,
+                sources=[{"role": source_role}],
+            )
             for proposal in found:
                 if counts["proposals"] >= max_items:
                     break
@@ -1276,6 +1356,12 @@ class KnowledgeService:
         source = Path(path)
         if not source.is_file():
             raise self._json_error("import path must be an existing file")
+        if source.stat().st_size > MAX_IMPORT_BYTES:
+            raise ServiceError(
+                ErrorCode.BUDGET_EXCEEDED,
+                "import file exceeds the 32 MiB bound",
+                details={"max_bytes": MAX_IMPORT_BYTES},
+            )
         records: list[dict[str, Any]] = []
         malformed_lines = 0
         try:
@@ -1284,6 +1370,12 @@ class KnowledgeService:
                     text = line.strip()
                     if not text:
                         continue
+                    if len(records) + malformed_lines + 1 > MAX_IMPORT_RECORDS:
+                        raise ServiceError(
+                            ErrorCode.BUDGET_EXCEEDED,
+                            "import file exceeds the 50000 record bound",
+                            details={"max_records": MAX_IMPORT_RECORDS},
+                        )
                     parsed = json.loads(text)
                     if not isinstance(parsed, dict):
                         malformed_lines += 1
@@ -1804,6 +1896,15 @@ class KnowledgeService:
             return self.integrations_reindex()
         if name == "integrations.extract":
             value = arguments.get("entry_id") or arguments.get("entry")
+            batch = arguments.get("entry_ids")
+            if value and batch is not None:
+                raise self._json_error("entry_id and entry_ids are mutually exclusive")
+            if batch is not None:
+                if isinstance(batch, str) or not isinstance(batch, Sequence):
+                    raise self._json_error("entry_ids must be a list of entry ids")
+                if not batch:
+                    raise self._json_error("entry_ids must not be empty")
+                return self.integrations_extract([str(entry_id) for entry_id in batch])
             if not value:
                 raise self._json_error("entry_id is required")
             return self.integrations_extract(str(value))

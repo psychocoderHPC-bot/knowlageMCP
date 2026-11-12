@@ -149,12 +149,15 @@ Caps: 4096 bytes per string (request and response), 200 characters per
 generated title, 32 tags, 16 scope keys, 32 edges, 20 items.
 
 Neither adapter writes to SQLite, publishes entries, attaches confidence
-scores, or sets lifecycle or evidence state. `integrations extract ENTRY`
-stores the proposals in `extraction_proposals` with state `proposed` and
-audits the call. Inspect them with:
+scores, or sets lifecycle or evidence state. `integrations extract ENTRY
+[ENTRY ...]` accepts one or more entry ids and makes one extractor call per
+unique entry. A batch is rejected with `INVALID_ARGUMENT` when the number of
+unique entries exceeds `integrations.graphiti.max_calls_per_task`, which names
+the cap in the error. Successful proposals go to `extraction_proposals` with
+state `proposed`, and each call is audited. Inspect them with:
 
 ```bash
-knowlageMCP-gatewayctl integrations extract ENTRY
+knowlageMCP-gatewayctl integrations extract ENTRY [ENTRY ...]
 knowlageMCP-gatewayctl integrations proposals [--entry ENTRY] [--state STATE]
 ```
 
@@ -197,7 +200,7 @@ Commands (see also [operations.md](operations.md)):
 knowlageMCP-gatewayctl integrations status [--json]
 knowlageMCP-gatewayctl integrations probe [--json]
 knowlageMCP-gatewayctl integrations reindex [--json]
-knowlageMCP-gatewayctl integrations extract ENTRY [--json]
+knowlageMCP-gatewayctl integrations extract ENTRY [ENTRY ...] [--json]
 knowlageMCP-gatewayctl integrations proposals [--entry ENTRY] [--state STATE] [--json]
 knowlageMCP-gatewayctl integrations import-memories FILE [--dry-run] [--json]
 ```
@@ -210,13 +213,23 @@ knowlageMCP-gatewayctl integrations import-memories FILE [--dry-run] [--json]
   `none`, embeds the current published, disputed, and candidate revisions
   into a new generation. The previous ready generation for a different model
   or dimension set is marked `stale`; the new one is marked `ready`.
+- `extract` resolves every entry before calling the extractor. For one entry
+  the JSON result keeps the top-level `entry_id`, `revision_id`, `extractor`,
+  `available`, and `proposals` fields; every result also lists per-entry rows
+  and the `calls` and `cap` values.
 - `import-memories FILE` reads JSONL records of `{"role","text","source_role",
-  "task"}` and creates new candidate entries through the normal insert path,
-  preserving source role, `unverified` evidence, a `mem0` tag, and a
-  `derived_from` provenance edge when the source entry is known. It
-  deduplicates by content hash, never publishes or overwrites, and caps total
-  proposals at `integrations.mem0.max_items`. `--dry-run` reports without
-  writing.
+  "task","entry_id","revision_id"}` and writes candidate entries to the initial
+  shared namespace (`identity.initial_namespace`) through the normal insert
+  path. It preserves the original `role`/`source_role`, `unverified` evidence,
+  and a `mem0` tag, and adds a `derived_from` provenance edge when an optional
+  `entry_id` or `revision_id` identifies a known revision. The extractor
+  receives the conversation role as `messages[0].role`. It deduplicates by
+  content hash, never publishes or overwrites, and limits the run to
+  `integrations.mem0.max_items` extractor calls, which also bounds proposals.
+  Every extractor call counts against that budget, even when it returns no
+  proposals, and the result reports `calls`. `--dry-run` still calls the
+  extractor to count proposals, then reports without writing. Imports are
+  bounded to 32 MiB and 50,000 records; split larger files before importing.
 
 **Model and dimension changes.** Changing `embedding.model` or
 `embedding.dimensions` starts a new generation: the old one is marked `stale`,
@@ -246,8 +259,10 @@ one `reindex`, nothing else.
   loop; the lexical result is the answer.
 - **Explicit administrative operations are fail-closed.** `reindex` fails
   with `BACKEND_UNAVAILABLE` when it cannot build the index (the generation
-  is marked `failed`); `extract` and `import-memories` fail when the
-  extractor is not configured.
+  is marked `failed`). `extract` and `import-memories` fail with
+  `BACKEND_UNAVAILABLE` when an extractor is configured but unavailable. With
+  the `null` extractor (nothing configured), both return an empty soft result
+  with `available: false` so an operator can inspect the configuration.
 - **Indexing after writes is best-effort.** A failed upsert never fails or
   rolls back the canonical write; the revision is simply missing from the
   derived index until the next `reindex`.
@@ -284,7 +299,11 @@ uses external network access; CI runs without it.
 - No mandatory cloud service. A remote embedding endpoint is an explicit
   operator choice; `hash` and `none` are fully offline.
 - No Qdrant, Graphiti, or Mem0 client libraries. The adapters speak plain
-  REST over a small internal JSON HTTP helper.
+  REST over a small internal JSON HTTP helper. Graphiti is used as an
+  extraction adapter only; graph-native retrieval is not exposed, and
+  canonical retrieval stays in SQLite so ACL and review remain authoritative.
+- Mem0 provides conversation extraction only. It emits proposals and never
+  overwrites canonical entries.
 - No claim that semantic search improves task outcomes. The measured baseline
   in [testing.md](testing.md) covers the lexical pipeline; semantic retrieval
   is measured only as retrieval behavior.

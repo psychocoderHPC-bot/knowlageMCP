@@ -8,12 +8,13 @@ import json
 import socket
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from conftest import ServiceEnv, build_env
 from knowlage_mcp.config import write_config_atomic
-from knowlage_mcp.integrations.base import IntegrationStatus
+from knowlage_mcp.integrations.base import IntegrationStatus, MemoryProposal
 from knowlage_mcp.models import (
     EntryPayload,
     ErrorCode,
@@ -549,3 +550,141 @@ def test_migration_foreign_keys_and_indices(env: ServiceEnv) -> None:
             "'2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z', "
             "'2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')"
         )
+
+
+class _RecordingExtractor:
+    name = "stub"
+    available = True
+
+    def __init__(self, proposals: list[MemoryProposal] | None = None) -> None:
+        self.proposals = proposals or []
+        self.calls = 0
+        self.sources: list[Any] = []
+
+    def extract(self, text: str, task: str | None = None, sources: Any = ()) -> list[MemoryProposal]:
+        del text, task
+        self.calls += 1
+        self.sources.append(list(sources))
+        return list(self.proposals)
+
+    def health(self) -> dict[str, Any]:
+        return {"name": self.name, "available": self.available}
+
+
+def _stub_proposal() -> MemoryProposal:
+    return MemoryProposal(kind="observation", title="stub", claim="stub claim", tags=("stub",))
+
+
+def test_integrations_extract_single_entry_keeps_compatibility(env: ServiceEnv) -> None:
+    entry = env.service.memory_add("observation", "shared", "single extract source", title="single")
+    extractor = _RecordingExtractor([_stub_proposal()])
+    env.service.integrations.extractor = extractor
+
+    result = env.service.integrations_extract(entry.entry.entry_id)
+
+    assert result["entry_id"] == entry.entry.entry_id
+    assert result["revision_id"] == entry.entry.revision_id
+    assert result["extractor"] == "stub"
+    assert result["available"] is True
+    assert len(result["proposals"]) == 1
+    assert result["calls"] == 1
+    assert result["cap"] == env.config.integrations.graphiti.max_calls_per_task
+    assert len(result["entries"]) == 1
+
+
+def test_integrations_extract_batch_makes_one_call_per_entry(env: ServiceEnv) -> None:
+    first = env.service.memory_add("observation", "shared", "first source", title="first")
+    second = env.service.memory_add("observation", "shared", "second source", title="second")
+    extractor = _RecordingExtractor([_stub_proposal()])
+    env.service.integrations.extractor = extractor
+
+    result = env.service.integrations_extract(
+        [first.entry.entry_id, second.entry.entry_id, first.entry.entry_id]
+    )
+
+    assert extractor.calls == 2
+    assert result["calls"] == 2
+    assert [row["entry_id"] for row in result["entries"]] == [
+        first.entry.entry_id,
+        second.entry.entry_id,
+    ]
+    assert [row["proposals"] for row in result["entries"]] == [1, 1]
+    assert [row["stored"] for row in result["entries"]] == [1, 1]
+    assert "entry_id" not in result
+
+
+def test_integrations_extract_rejects_batches_over_the_cap(env: ServiceEnv) -> None:
+    ids = [
+        env.service.memory_add(
+            "observation", "shared", f"source {index}", title=f"source {index}"
+        ).entry.entry_id
+        for index in range(2)
+    ]
+    env.service.integrations.extractor = _RecordingExtractor([_stub_proposal()])
+    env.service.config.integrations.graphiti.max_calls_per_task = 1
+
+    with pytest.raises(ServiceError) as excinfo:
+        env.service.integrations_extract(ids)
+
+    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+    assert "max_calls_per_task cap (1)" in str(excinfo.value)
+
+
+def test_integrations_extract_fails_closed_for_configured_unavailable(env: ServiceEnv) -> None:
+    entry = env.service.memory_add("observation", "shared", "unavailable source", title="unavailable")
+    extractor = _RecordingExtractor()
+    extractor.available = False
+    env.service.integrations.extractor = extractor
+
+    with pytest.raises(ServiceError) as excinfo:
+        env.service.integrations_extract(entry.entry.entry_id)
+
+    assert excinfo.value.code is ErrorCode.BACKEND_UNAVAILABLE
+
+
+def test_integrations_extract_null_extractor_returns_soft_result(env: ServiceEnv) -> None:
+    entry = env.service.memory_add("observation", "shared", "null source", title="null")
+
+    result = env.service.integrations_extract(entry.entry.entry_id)
+
+    assert result["available"] is False
+    assert result["proposals"] == []
+    assert result["calls"] == 0
+    assert result["entries"][0]["available"] is False
+
+
+def test_integrations_import_memories_budgets_calls_and_preserves_role(
+    env: ServiceEnv,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "many.jsonl"
+    path.write_text(
+        "\n".join(json.dumps({"role": "user", "text": f"memory {index}"}) for index in range(25)) + "\n",
+        encoding="utf-8",
+    )
+    extractor = _RecordingExtractor()
+    env.service.integrations.extractor = extractor
+    env.service.config.integrations.mem0.max_items = 5
+
+    counts = env.service.integrations_import_memories(path, dry_run=True)
+
+    assert counts["calls"] == 5
+    assert counts["proposals"] == 0
+    assert extractor.calls == 5
+    assert extractor.sources == [[{"role": "user"}] for _ in range(5)]
+
+
+def test_integrations_import_memories_fails_closed_for_configured_unavailable(
+    env: ServiceEnv,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "memories.jsonl"
+    path.write_text(json.dumps({"role": "user", "text": "hello"}) + "\n", encoding="utf-8")
+    extractor = _RecordingExtractor()
+    extractor.available = False
+    env.service.integrations.extractor = extractor
+
+    with pytest.raises(ServiceError) as excinfo:
+        env.service.integrations_import_memories(path, dry_run=True)
+
+    assert excinfo.value.code is ErrorCode.BACKEND_UNAVAILABLE

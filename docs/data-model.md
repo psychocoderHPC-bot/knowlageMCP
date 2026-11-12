@@ -34,6 +34,24 @@ are never edited.
 | `deletion_ledger` | Forgetting tombstones: `object_type`, `object_id`, `deleted_at`, `reason?`. |
 | `entry_fts` | FTS5 virtual table over `title`, `claim`, `conditions`, `tags` (`unicode61 remove_diacritics 2`), with `entry_id` and `revision_id` unindexed. |
 
+## Optional integration tables (migration v2)
+
+Migration 2 adds three tables for the optional integrations layer. All three
+hold derived or proposal data, never canonical knowledge: they are
+rebuildable, and they are never authoritative for ACL decisions or
+publication state.
+
+| Table | Purpose |
+|---|---|
+| `index_generations` | `generation_id`, `backend`, `model`, `dimensions`, `state`, `created_at`, `updated_at`. `state` moves `building` -> `ready`, and to `stale` or `failed` when the embedding model or index health changes. `UNIQUE (backend, model, dimensions, state)` keeps one row per backend/model/dimension/state combination. |
+| `entry_index_state` | Which revision a generation has indexed: `generation_id`, `revision_id`, `backend`, `content_hash`, `indexed_at`. Primary key `(generation_id, revision_id)`. Both foreign keys cascade on delete; a changed `content_hash` marks the indexed copy behind the revision. |
+| `extraction_proposals` | Extractor output only: `proposal_id`, `entry_id`, `revision_id`, `extractor`, `relation?`, `subject?`, `object?`, `detail?`, `state` (default `proposed`), `created_at`. Foreign keys cascade from `entries` and `entry_revisions`. Extractor output never becomes a revision without an explicit write. |
+
+Vector points, generation rows, and extraction proposals are derived or
+proposal-only data. Losing or rebuilding them does not change canonical
+entries, grants, or review outcomes; the SQLite tables remain the source of
+truth for ACL checks and publication eligibility.
+
 ## Entry revisions
 
 Each `entry_revisions` row is immutable and contains:

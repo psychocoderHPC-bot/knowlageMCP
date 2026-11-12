@@ -5,9 +5,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
+
 from conftest import build_env
+from knowlage_mcp.models import ErrorCode, ServiceError
+from knowlage_mcp.service import MAX_IMPORT_BYTES, MAX_IMPORT_RECORDS
 
 
 def _import_header() -> dict:
@@ -84,3 +89,64 @@ def test_import_counts_in_batch_duplicate_revision_ids_as_malformed(
         )
     finally:
         env.db.close()
+
+
+def test_import_jsonl_rejects_an_oversized_file(tmp_path: Path) -> None:
+    path = tmp_path / "oversized.jsonl"
+    path.touch()
+    os.truncate(path, MAX_IMPORT_BYTES + 1)
+    env = build_env(tmp_path / "data")
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            env.service.import_jsonl(path)
+    finally:
+        env.db.close()
+
+    assert excinfo.value.code is ErrorCode.BUDGET_EXCEEDED
+    assert excinfo.value.details == {"max_bytes": MAX_IMPORT_BYTES}
+
+
+def test_import_jsonl_rejects_too_many_records(tmp_path: Path) -> None:
+    path = tmp_path / "many.jsonl"
+    lines = [json.dumps(_import_header())]
+    lines.extend("{}" for _ in range(MAX_IMPORT_RECORDS))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    env = build_env(tmp_path / "data")
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            env.service.import_jsonl(path)
+    finally:
+        env.db.close()
+
+    assert excinfo.value.code is ErrorCode.BUDGET_EXCEEDED
+    assert excinfo.value.details == {"max_records": MAX_IMPORT_RECORDS}
+
+
+def test_integrations_import_memories_rejects_an_oversized_file(tmp_path: Path) -> None:
+    path = tmp_path / "oversized-memories.jsonl"
+    path.touch()
+    os.truncate(path, MAX_IMPORT_BYTES + 1)
+    env = build_env(tmp_path / "data")
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            env.service.integrations_import_memories(path, dry_run=True)
+    finally:
+        env.db.close()
+
+    assert excinfo.value.code is ErrorCode.BUDGET_EXCEEDED
+    assert excinfo.value.details == {"max_bytes": MAX_IMPORT_BYTES}
+
+
+def test_integrations_import_memories_rejects_too_many_records(tmp_path: Path) -> None:
+    path = tmp_path / "many-memories.jsonl"
+    record = json.dumps({"role": "user", "text": "memory"})
+    path.write_text("\n".join([record] * (MAX_IMPORT_RECORDS + 1)) + "\n", encoding="utf-8")
+    env = build_env(tmp_path / "data")
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            env.service.integrations_import_memories(path, dry_run=True)
+    finally:
+        env.db.close()
+
+    assert excinfo.value.code is ErrorCode.BUDGET_EXCEEDED
+    assert excinfo.value.details == {"max_records": MAX_IMPORT_RECORDS}

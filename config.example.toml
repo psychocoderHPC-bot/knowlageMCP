@@ -77,12 +77,13 @@ keep_weekly = 4
 [logging]
 level = "INFO"
 
-# Optional semantic/vector layer. Disabled by default; canonical data, ACLs, and review decisions stay in SQLite. Secrets are referenced by environment variable name only.
+# Optional semantic/vector layer. Off by default; no network while disabled.
 [integrations]
 enabled = false
 inference = false
 telemetry = false
 
+# Embedding provider: "none", offline "hash", or any OpenAI-compatible endpoint. api_key_env names the environment variable holding the key; personal content is indexed only with allow_private_text = true.
 [integrations.embedding]
 provider = "none"
 model = "text-embedding-3-small"
@@ -93,6 +94,7 @@ batch_size = 16
 timeout_s = 20.0
 allow_private_text = false
 
+# Vector store: "none" (default) or "qdrant". api_key_env names the environment variable holding the key; the index is derived and rebuildable from SQLite.
 [integrations.vector]
 backend = "none"
 url = "http://127.0.0.1:6333"
@@ -104,6 +106,7 @@ timeout_s = 10.0
 top_k = 40
 hybrid = true
 
+# Reranker: "none", offline "lexical", or an OpenAI-compatible endpoint. api_key_env names the environment variable holding the key.
 [integrations.reranker]
 provider = "none"
 model = "rerank-1"
@@ -112,6 +115,7 @@ api_key_env = "KNOWLAGEMCP_RERANK_API_KEY"
 top_n = 20
 timeout_s = 10.0
 
+# Graphiti extractor (proposal-only; disabled by default). api_key_env names the environment variable holding the key; max_calls_per_task caps entries per extract call.
 [integrations.graphiti]
 enabled = false
 base_url = "http://127.0.0.1:8000"
@@ -119,6 +123,7 @@ api_key_env = "KNOWLAGEMCP_GRAPHITI_API_KEY"
 timeout_s = 20.0
 max_calls_per_task = 4
 
+# Mem0 extractor (proposal-only; disabled by default). api_key_env names the environment variable holding the key; max_items caps extractor calls per import.
 [integrations.mem0]
 enabled = false
 base_url = "http://127.0.0.1:8001"

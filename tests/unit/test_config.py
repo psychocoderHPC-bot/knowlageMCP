@@ -290,6 +290,45 @@ def test_integration_validation_reports_bad_values(tmp_config: Config) -> None:
     assert "mem0.max_items" in joined
 
 
+def test_qdrant_backend_requires_a_real_embedding_provider(tmp_config: Config) -> None:
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.vector.backend = "qdrant"
+    problems = validate_config(cfg)
+    assert any("requires integrations.embedding.provider" in problem for problem in problems)
+
+    cfg.integrations.embedding.provider = "hash"
+    assert validate_config(cfg) == []
+
+    cfg.integrations.embedding.provider = "openai"
+    cfg.integrations.embedding.base_url = "https://example.invalid/v1"
+    assert validate_config(cfg) == []
+
+
+def test_graphiti_and_mem0_extractors_are_mutually_exclusive(tmp_config: Config) -> None:
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = True
+    cfg.integrations.graphiti.enabled = True
+    cfg.integrations.mem0.enabled = True
+    problems = validate_config(cfg)
+    assert any("mutually exclusive" in problem for problem in problems)
+
+    cfg.integrations.mem0.enabled = False
+    assert validate_config(cfg) == []
+    cfg.integrations.graphiti.enabled = False
+    cfg.integrations.mem0.enabled = True
+    assert validate_config(cfg) == []
+
+
+def test_master_switch_off_accepts_nested_adapter_configuration(tmp_config: Config) -> None:
+    cfg = tmp_config.model_copy(deep=True)
+    cfg.integrations.enabled = False
+    cfg.integrations.embedding.provider = "hash"
+    cfg.integrations.vector.backend = "qdrant"
+    cfg.integrations.graphiti.enabled = True
+    assert validate_config(cfg) == []
+
+
 def test_embedding_may_send_guards_private_text() -> None:
     remote = EmbeddingIntegrationConfig(provider="openai", base_url="https://example.invalid/v1")
     assert remote.embedding_may_send("shared") is True

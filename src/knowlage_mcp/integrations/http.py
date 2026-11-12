@@ -24,6 +24,8 @@ DEFAULT_ATTEMPTS = 3
 #: Exponential backoff between retries, capped to keep a probe bounded.
 DEFAULT_BACKOFF_BASE_S = 0.1
 DEFAULT_BACKOFF_MAX_S = 1.0
+#: Hard ceiling for a backend response body; larger bodies are rejected unread.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 #: Methods safe to retry. ``POST`` is deliberately absent.
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD"})
@@ -165,6 +167,11 @@ class JsonHttpClient:
                     _map_status(status),
                     f"{normalized} {path} failed with status {status}",
                 )
+            if len(response.content) > MAX_RESPONSE_BYTES:
+                raise ServiceError(
+                    ErrorCode.BACKEND_UNAVAILABLE,
+                    "backend response exceeded the 4 MiB bound",
+                )
             if status == 204 or not response.content:
                 return None
             try:
@@ -189,4 +196,4 @@ class JsonHttpClient:
         self.close()
 
 
-__all__ = ["JsonHttpClient"]
+__all__ = ["MAX_RESPONSE_BYTES", "JsonHttpClient"]

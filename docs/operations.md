@@ -180,6 +180,13 @@ knowlageMCP-gatewayctl backup prune [--keep-daily N] [--keep-weekly N] [--dry-ru
 - `restore SNAP --destination DIR` restores into a separate directory. It
   refuses to overwrite a non-empty destination, and it re-applies the deletion
   ledger so forgotten content does not resurrect.
+
+  The Qdrant vector index is derived and is not part of the backup snapshot, so
+  after a restore the operator should run
+  `knowlageMCP-gatewayctl integrations reindex` to rebuild it for the restored
+  database. Stale points are never trusted for ACL or scope: hits are
+  re-checked against SQLite, so the only cost is incomplete semantic recall
+  until the rebuild.
 - `prune` applies the configured retention policy explicitly. It keeps the
   newest snapshot for each of the most recent `--keep-daily` days (default
   `backup.keep_daily`, 7) and the newest snapshot for each of the most recent
@@ -209,7 +216,8 @@ and namespaces. Exports preserve source attribution and any stated content
 license; operational knowledge is not automatically relicensed. Imports are
 operator-initiated, idempotent, and untrusted by default: imported role names
 or `verified` labels never grant authority. `--dry-run` validates the file and
-reports what would change without writing.
+reports what would change without writing. Imports are bounded to 32 MiB and
+50,000 records; split larger files before importing.
 
 ## Index maintenance
 
@@ -250,19 +258,27 @@ to serve lexical FTS5 search when an adapter is absent or down.
   and dimensions still match the configured embedding adapter, so semantic
   search resumes without a second reindex; a mismatch keeps the vector index
   unavailable until an operator reindexes.
-- `extract ENTRY` stores extractor proposals in `extraction_proposals` with
-  state `proposed`. It never creates, publishes, or modifies entries.
+- `extract ENTRY [ENTRY ...]` stores extractor proposals in
+  `extraction_proposals` with state `proposed`, making one extractor call per
+  unique entry. A batch larger than `integrations.graphiti.max_calls_per_task`
+  is rejected with `INVALID_ARGUMENT` naming the cap. It never creates,
+  publishes, or modifies entries.
 - `proposals` lists advisory extraction proposals, newest first, capped at 50
   rows. Filter with `--entry` and `--state` (default `proposed`). It accepts or
   rejects nothing: acceptance goes through the normal candidate and review
   path.
 - `import-memories FILE` reads JSONL records of
-  `{"role","text","source_role","task"}` and creates new candidate entries
-  through the normal knowledge insert path, preserving the source role,
-  `unverified` evidence, a `mem0` tag, and a `derived_from` provenance edge when
-  the source entry is known. It deduplicates by content hash, never publishes,
-  never overwrites, and caps total proposals at `integrations.mem0.max_items`.
-  `--dry-run` runs extraction and reports counts without writing.
+  `{"role","text","source_role","task","entry_id","revision_id"}` and writes new
+  candidate entries to the initial shared namespace
+  (`identity.initial_namespace`) through the normal knowledge insert path. It
+  preserves the original `role`/`source_role`, `unverified` evidence, a `mem0`
+  tag, and a `derived_from` provenance edge when the optional `entry_id` or
+  `revision_id` identifies a known revision. The extractor receives the
+  conversation role as `messages[0].role`. It deduplicates by content hash,
+  never publishes, never overwrites, and budgets the run to
+  `integrations.mem0.max_items` extractor calls; every call counts, even one
+  that returns no proposals, and the result reports `calls`. `--dry-run` still
+  calls the extractor to count proposals, then reports counts without writing.
 
 Search stays lexical unless the embedding and vector adapters are enabled and
 healthy. When semantic use succeeds, search and context responses report

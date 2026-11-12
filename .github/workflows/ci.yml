@@ -126,6 +126,18 @@ jobs:
           skill = importlib.resources.files(knowlage_mcp).joinpath("resources", "SKILL.md")
           assert skill.is_file(), "packaged SKILL.md is missing"
           assert skill.read_text(encoding="utf-8").strip()
+
+          import knowlage_mcp.integrations.qdrant
+          import knowlage_mcp.integrations.embeddings
+          import knowlage_mcp.integrations.rerank
+          import knowlage_mcp.integrations.graphiti
+          import knowlage_mcp.integrations.mem0
+          import knowlage_mcp.integrations.registry
+          from knowlage_mcp.integrations.hash_embed import HashEmbeddingProvider
+
+          vectors = HashEmbeddingProvider(dimensions=8).embed(["x"])
+          assert len(vectors) == 1
+          assert len(vectors[0]) == 8
           PY
           /tmp/kmcp-venv/bin/knowlageMCP-gateway --help
           /tmp/kmcp-venv/bin/knowlageMCP-gatewayctl --help

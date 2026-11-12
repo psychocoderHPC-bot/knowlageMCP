@@ -567,6 +567,11 @@ def validate_config(config: Config) -> list[str]:
             _is_http_url(vector.url),
             "integrations.vector.url must be an http(s) URL for backend 'qdrant'",
         )
+        check(
+            embedding.provider in {"hash", "openai"},
+            "integrations.vector.backend 'qdrant' requires integrations.embedding.provider "
+            "to be 'hash' or 'openai'; 'none' cannot produce vectors",
+        )
         if embedding.provider in {"hash", "openai"}:
             check(
                 vector.vector_size == embedding.dimensions,
@@ -613,6 +618,10 @@ def validate_config(config: Config) -> list[str]:
             _is_http_url(mem0.base_url),
             "integrations.mem0.base_url must be an http(s) URL when enabled",
         )
+    check(
+        not (graphiti.enabled and mem0.enabled),
+        "integrations.graphiti.enabled and integrations.mem0.enabled are mutually exclusive",
+    )
     return problems
 
 

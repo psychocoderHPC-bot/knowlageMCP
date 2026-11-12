@@ -459,6 +459,9 @@ def test_mem0_import_over_the_wire_creates_candidates_idempotently(
     assert dry["created"] == 0
     assert dry["proposals"] >= 1
     assert fake_mem0.requests >= 1
+    assert fake_mem0.message_roles
+    assert set(fake_mem0.message_roles) == {"user_message"}
+    assert dry["calls"] >= 1
 
     assert (
         gatewayctl.main(

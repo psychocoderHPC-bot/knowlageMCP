@@ -132,7 +132,8 @@ evidence inventory, and the application version.
 
 The optional semantic/vector layer. Every adapter is off by default; with
 `enabled = false` the service constructs only offline null adapters and makes
-no network I/O. Secrets are referenced by environment variable name only; no
+no network I/O. Nested adapter settings may be present in that state; the
+master switch disables them at runtime without a validation error. Secrets are referenced by environment variable name only; no
 config key holds a key value. See [integrations.md](integrations.md) for the
 architecture, operations, and failure semantics.
 
@@ -159,7 +160,7 @@ architecture, operations, and failure semantics.
 
 | Key | Default | Effect |
 |---|---|---|
-| `backend` | `none` | `none` or `qdrant`. The index is derived and rebuildable; it is never authoritative for ACL or review. |
+| `backend` | `none` | `none` or `qdrant`. `qdrant` requires `integrations.embedding.provider` to be `hash` or `openai`; `none` produces no vectors and is rejected. The index is derived and rebuildable; it is never authoritative for ACL or review. |
 | `url` | `http://127.0.0.1:6333` | Qdrant REST endpoint. Must be an http(s) URL when `backend = "qdrant"`. |
 | `api_key_env` | `KNOWLAGEMCP_QDRANT_API_KEY` | Environment variable name for the Qdrant API key, sent as a Bearer token when set. |
 | `collection_prefix` | `knowlagemcp` | Prefix of the per-generation collection names (`prefix_gen_<16 hex>`). Must not be empty. |
@@ -188,17 +189,17 @@ architecture, operations, and failure semantics.
 | `base_url` | `http://127.0.0.1:8000` | Graphiti-compatible endpoint. Must be an http(s) URL when enabled. |
 | `api_key_env` | `KNOWLAGEMCP_GRAPHITI_API_KEY` | Environment variable name for the API key. |
 | `timeout_s` | `20.0` | Per-request timeout. Must be positive. |
-| `max_calls_per_task` | `4` | Bound on extraction calls. Must be positive. |
+| `max_calls_per_task` | `4` | Maximum extractor calls per `integrations extract` command, which is also the maximum number of entries in one batch. Must be positive. |
 
 ### [integrations.mem0]
 
 | Key | Default | Effect |
 |---|---|---|
-| `enabled` | `false` | Enable the proposal-only Mem0 extraction adapter. If both Graphiti and Mem0 are enabled, Graphiti is selected. |
+| `enabled` | `false` | Enable the proposal-only Mem0 extraction adapter. Mutually exclusive with `integrations.graphiti.enabled`; enabling both is a validation error. |
 | `base_url` | `http://127.0.0.1:8001` | Mem0-compatible endpoint. Must be an http(s) URL when enabled. |
 | `api_key_env` | `KNOWLAGEMCP_MEM0_API_KEY` | Environment variable name for the API key. |
 | `timeout_s` | `20.0` | Per-request timeout. Must be positive. |
-| `max_items` | `20` | Maximum proposals per extraction call and per `import-memories` run. Must be positive. |
+| `max_items` | `20` | Maximum proposals per extraction call, and maximum extractor calls per `import-memories` run, which also bounds proposals. Must be positive. |
 
 ### Legacy keys
 

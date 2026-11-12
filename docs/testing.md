@@ -27,11 +27,11 @@ Markers: `integration` (real transports or processes), `security`
 
 ## Inventory
 
-The current suite has 364 tests:
+The current suite has 391 tests:
 
 | Layer | Tests |
 |---|---|
-| `tests/unit` | 277 |
+| `tests/unit` | 304 |
 | `tests/integration` | 43 |
 | `tests/security` | 40 |
 | `tests/quality` | 4 |
@@ -114,6 +114,12 @@ venv outside the tree.
   filtering, reranker ordering without additions, fail-open lexical fallback
   with a response warning, zero HTTP requests while disabled, dimension
   mismatch handling, restart generation adoption, and the privacy gate.
+- Integrations budgets: `tests/unit/test_service.py` covers the
+  `integrations.graphiti.max_calls_per_task` batch-extract cap (one call per
+  unique entry, `INVALID_ARGUMENT` naming the cap when a batch exceeds it) and
+  the `integrations.mem0.max_items` extractor call budget for
+  `import-memories` (every call counts, even one that returns no proposals,
+  and the run stops at the budget).
 
 ## Integration layer
 

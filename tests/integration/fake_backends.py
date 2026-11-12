@@ -324,17 +324,22 @@ class FakeMem0Server(_FakeHttpServer):
 
     def __init__(self) -> None:
         self.requests = 0
+        self.message_roles: list[str] = []
         super().__init__()
 
-    def handle(self, method: str, path: str, _body_raw: bytes, _headers: Any) -> tuple[int, Any]:
+    def handle(self, method: str, path: str, body_raw: bytes, _headers: Any) -> tuple[int, Any]:
         self._record(method, path)
         injected = self._injected_failure()
         if injected is not None:
             return injected, {"error": {"message": "injected failure"}}
         if method != "POST" or self._split(path).path != "/memories/extract":
             return 404, {"error": {"message": "unknown"}}
+        body = self._json(body_raw)
+        messages = body.get("messages") if isinstance(body, dict) else None
+        role = str(messages[0].get("role")) if isinstance(messages, list) and messages else "unknown"
         with self._lock:
             self.requests += 1
+            self.message_roles.append(role)
         return 200, {"memories": [dict(memory) for memory in self.MEMORIES]}
 
 
