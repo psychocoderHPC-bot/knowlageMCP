@@ -239,6 +239,7 @@ latency baseline on the reference hardware.
 - [docs/troubleshooting.md](docs/troubleshooting.md) - symptom to fix
 - [docs/mentor.md](docs/mentor.md) - mentor operating procedure
 - [docs/integrations.md](docs/integrations.md) - adapter boundaries, JSONL format
+- [docs/security-checklist.md](docs/security-checklist.md) - trust-boundary guarantees mapped to enforcement and regression tests
 - [LICENSE](LICENSE) (ISC), [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ### Limitations

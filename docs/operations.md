@@ -319,6 +319,49 @@ either request bucket, and registration has its own limiter.
 | Registration | `registration_per_minute_per_source`, `registration_per_minute_global` | 10 per source, 60 globally |
 | Candidate writes | `candidate_writes_per_hour`, `candidate_writes_per_hour_global` | 20 per agent, 200 globally |
 
+## Exposing the gateway beyond loopback
+
+The default binding is loopback (`server.host = "127.0.0.1"`). For a single
+container runtime the default `server.allowed_hosts` list already includes
+`host.containers.internal`, so a terok container can reach a loopback port
+without further configuration. Do not widen `allowed_hosts` to reach a
+container when the runtime already forwards loopback: it is the wrong fix and
+it changes the trust model.
+
+If you must bind the gateway to a non-loopback address, change all four of
+these together. The allowlist is enforced per request by the `Host`/`Origin`
+middleware; there is no automatic widening, and `doctor` reports a
+`listener_exposure` warning when the bind address is not loopback:
+
+1. `server.host`: the listen address (for example `0.0.0.0` or a LAN IP).
+2. `server.allowed_hosts`: the exact `Host` header values you will accept.
+   Keep this minimal and explicit. A value other than the loopback defaults
+   makes the gateway reject every request whose `Host` header does not match.
+3. `server.allowed_origins`: browser `Origin` values to accept. Leave empty
+   for the non-browser agent surface. Only add an origin if a browser UI talks
+   to the gateway directly.
+4. `limits` and the listener exposure in the terok shield. The shield grant
+   `localhost:2230` covers loopback only; a non-loopback address needs its own
+   explicit allow rule and, for already-running tasks, recreation of the task
+   so the new grant takes effect.
+
+The agent-facing TCP/MCP surface never exposes administration, SQL, backup
+destinations, or host filesystem paths, so exposing it does not widen the admin
+surface. The Unix-domain admin socket stays on the host and is not reachable
+through the network listener.
+
+Before you bind beyond loopback, confirm:
+
+- `allowed_hosts` and `allowed_origins` contain only the values you intend.
+- The terok shield allows the new address for the containers that need it.
+- Rate limits in `[limits]` are appropriate for the wider exposure
+  (registration and request buckets apply across all sessions).
+- You have a backup, because a wider listener increases the chance of
+  malformed or hostile traffic reaching the parser.
+
+The trust-boundary claims and the regression tests that pin them are in
+[security-checklist.md](security-checklist.md).
+
 ## Exit codes
 
 | Code | Meaning |

@@ -111,6 +111,7 @@ def test_status_protocol_and_doctor(env: ServiceEnv, tmp_path: Path, monkeypatch
         "foreign_keys",
         "free_space",
         "listener",
+        "listener_exposure",
         "admin_socket",
         "container_reachability",
     } <= names
@@ -133,6 +134,33 @@ def test_doctor_reports_config_mode_and_missing_runtime_assets(
     config_file.chmod(0o600)
     refreshed = {check["name"]: check for check in env.service.doctor()["checks"]}
     assert refreshed["config_file"]["ok"] is True
+
+
+def test_doctor_reports_listener_exposure(env: ServiceEnv) -> None:
+    env.service.config.server.host = "127.0.0.1"
+    doctor = env.service.doctor()
+    names = [check["name"] for check in doctor["checks"]]
+    checks = {check["name"]: check for check in doctor["checks"]}
+    assert checks["listener_exposure"] == {
+        "name": "listener_exposure",
+        "ok": True,
+        "detail": "loopback only",
+    }
+    assert names.index("listener_exposure") == names.index("listener") + 1
+
+    env.service.config.server.host = "0.0.0.0"
+    env.service.config.server.allowed_hosts = ["10.0.0.5"]
+    env.service.config.server.allowed_origins = ["https://ui.example"]
+    checks = {check["name"]: check for check in env.service.doctor()["checks"]}
+    check = checks["listener_exposure"]
+    assert check["name"] == "listener_exposure"
+    assert check["ok"] is True
+    assert check["detail"].startswith(
+        "WARNING: bound to 0.0.0.0; require firewall, TLS or a trusted tunnel, "
+        "and an exact allowed_hosts list"
+    )
+    assert "allowed_hosts=[10.0.0.5]" in check["detail"]
+    assert "allowed_origins=[https://ui.example]" in check["detail"]
 
 
 def test_doctor_reports_disabled_integrations(env: ServiceEnv) -> None:

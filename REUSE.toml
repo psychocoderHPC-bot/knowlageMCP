@@ -21,6 +21,14 @@ precedence = "closest"
 SPDX-FileCopyrightText = "2026 René Widera"
 SPDX-License-Identifier = "ISC"
 
+# The machine-readable benchmark baseline is generated JSON and cannot carry
+# an SPDX comment header.
+[[annotations]]
+path = ["benchmarks/baseline_v1.json"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 René Widera"
+SPDX-License-Identifier = "ISC"
+
 # JSONL cannot carry SPDX comment headers; this annotation covers only the
 # golden version 1 export-format fixture.
 [[annotations]]

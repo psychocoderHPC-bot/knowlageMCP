@@ -27,6 +27,9 @@ expected impact. We aim to acknowledge reports within five working days.
 - Retrieved memory is data, not instructions. It cannot grant permissions,
   override the current user request, or authorize tool execution.
 
+Each guarantee above is enforced by production code and pinned by a regression
+test; the mapping is in [docs/security-checklist.md](docs/security-checklist.md).
+
 ## Administrative surface
 
 The Unix-domain admin socket is created with mode 0600 and rejects peers whose

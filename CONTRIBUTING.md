@@ -5,23 +5,33 @@ SPDX-License-Identifier: ISC
 
 # Contributing
 
-## Development setup
+## Development setup and validation
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e '.[dev]'
+./scripts/check.sh
 ```
 
-## Required checks
+The script resolves the repository root, creates `.venv` when missing, upgrades
+pip, installs `-e '.[dev]'`, and runs every required check plus a package build
+and a wheel-install smoke test in a temporary venv outside the tree.
+`SKIP_BUILD=1 ./scripts/check.sh` skips the build and smoke test, and
+`PYTHON=python3.14 ./scripts/check.sh` selects another interpreter.
 
-Run all of them before handing off a change:
+`pytest` requires the dev extra (`pip install -e '.[dev]'`), which is exactly
+what the script installs.
+
+### Optional manual commands
+
+After setup, the individual steps are:
 
 ```bash
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
 .venv/bin/mypy src/knowlage_mcp
-.venv/bin/pytest tests/unit -q
+.venv/bin/pytest -q
+.venv/bin/pytest tests/quality -q -s
 .venv/bin/reuse lint
+.venv/bin/python -m build
 ```
 
 ## Engineering rules

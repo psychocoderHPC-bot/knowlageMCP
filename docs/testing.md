@@ -27,11 +27,11 @@ Markers: `integration` (real transports or processes), `security`
 
 ## Inventory
 
-The current suite has 391 tests:
+The current suite has 401 tests:
 
 | Layer | Tests |
 |---|---|
-| `tests/unit` | 304 |
+| `tests/unit` | 314 |
 | `tests/integration` | 43 |
 | `tests/security` | 40 |
 | `tests/quality` | 4 |
@@ -53,16 +53,32 @@ servers built in `tests/integration/fake_backends.py`).
 ## Running
 
 ```bash
-.venv/bin/pytest tests/unit -q                 # unit layer
-.venv/bin/pytest tests/integration -q          # integration layer
-.venv/bin/pytest tests/security -q             # security layer
-.venv/bin/pytest -q                            # everything CI runs
+./scripts/check.sh
 ```
 
-CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check`,
-`mypy`, and the full `pytest` suite on Python 3.11 through 3.14, plus
-`reuse lint`, a package build, and a wheel-install smoke test in a fresh
-venv outside the tree.
+The script resolves the repository root, creates `.venv` when missing, upgrades
+pip, installs `-e '.[dev]'`, and runs every prescribed check in order: `ruff
+check`, `ruff format --check`, `mypy`, the full `pytest` suite, the quality
+corpus, `reuse lint`, `python -m build`, and a wheel-install smoke test in a
+temporary venv outside the source tree. Set `SKIP_BUILD=1` to skip the build
+and smoke test, or `PYTHON=python3.14` to select another interpreter.
+
+Individual steps, after the script has created the environment:
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/mypy src/knowlage_mcp
+.venv/bin/pytest -q
+.venv/bin/pytest tests/quality -q -s
+.venv/bin/reuse lint
+.venv/bin/python -m build
+```
+
+`pytest` needs the dev extra (`pip install -e '.[dev]'`), which is what the
+script installs. CI (`.github/workflows/ci.yml`) runs the same lint, type and
+test steps on Python 3.11 through 3.14, plus `reuse lint`, a package build, and
+a wheel-install smoke test in a fresh venv outside the tree.
 
 ## Unit layer
 
@@ -96,6 +112,9 @@ venv outside the tree.
   whose source lifecycle or evidence class is stronger than the import trust
   rule are counted as `downgraded` while still being stored as
   candidate/unverified.
+- Doctor: `tests/unit/test_service.py` covers `gatewayctl doctor` checks,
+  including `listener_exposure`, which flags a listener bound beyond the
+  configured bind address (e.g. `0.0.0.0` instead of loopback) as a warning.
 - Protocol negotiation: the compatibility matrix accepts the current major
   version and newer minors, and rejects older majors, empty strings,
   whitespace, and malformed versions.
@@ -180,14 +199,13 @@ venv outside the tree.
 - Secret redaction in logs, errors, JSON output, test reports, and MCP
   results.
 
-## Measured baseline (2026-11-11)
+## Measured baseline (2026-11-12)
 
-Measured on Intel Core Ultra 7 255U, 14 threads, Python 3.12.3, SQLite 3.45.1.
-These numbers are the state of this repository on that date; they are
-informational and are never CI gates. The suite was also run locally on
-CPython 3.14.7 with the current dependencies and the same result (201
-passed); 3.14 is locally verified here and CI-confirmed once the matrix job
-passes.
+Reference: `benchmarks/baseline_v1.json`, generated on Intel Core Ultra 7
+255U, 14 threads, Python 3.12.3, SQLite 3.45.1. The JSON carries the full
+environment metadata, query mix, response-byte counts, database size and
+per-mode latency percentiles. CI does not compare against it and no timing is
+a gate.
 
 Synthetic corpus (`benchmarks/corpus_v1.json`): 75 entries, 85 labelled
 queries (69 answerable, 12 no-answer, 4 adversarial), and 17 task scenarios,
@@ -196,33 +214,34 @@ with 0 recorded known gaps.
 | Metric | Value |
 |---|---|
 | recall@5 (69 answerable queries) | 1.000 |
-| precision@5 | 0.386 (reported, not gated) |
+| precision@5 | 0.387 (reported, not gated) |
 | no-answer failures | 0 of 12 |
 | forbidden/private namespace leaks | 0 |
 | context task scenarios passed | 17 of 17 (0 misses documented in `known_gaps`) |
 
-Latency (`benchmarks/run_bench.py`, real service layer, 5 results / 4000-byte
-budget per search):
+Latency (`benchmarks/run_bench.py`, real service layer, 10,000 synthetic
+entries, 5 results and a 4000-byte budget per search):
 
 | Workload | p50 | p95 |
 |---|---|---|
-| 1,000 entries, 10 clients | 9.4 ms | 46.8 ms |
-| 10,000 entries, 1 client | 13.0 ms | 28.9 ms |
-| 50 concurrent mixed clients, 1,000 calls | 168 ms | 375 ms |
-| 50 concurrent readers | 250 ms | 648 ms |
-| 10,000 entries, 10 clients | 22.0 ms | 181.6 ms |
+| 10,000 entries, 1 client | 15.8 ms | 38.9 ms |
+| 10,000 entries, 10 clients | 37.8 ms | 339.0 ms |
 
-The 250 ms 10-client p95 target is met at both measured sizes. Server-side
-synchronous SQLite work dominates the concurrency timings. All timings are
-reported as information only; CI runs deterministic query-plan and
-bounded-work checks, not wall-clock gates.
+The 10-client p95 was above the 250 ms target on this shared host. The target
+and every timing are informational. The JSON baseline is the machine-readable
+record; rerun on an idle host before comparing numbers. The full suite passed
+401 tests on CPython 3.12.3 and 401 tests on CPython 3.14.7.
 
-Rerun:
+Regenerate the baseline exactly:
 
 ```bash
-.venv/bin/pytest tests/quality -q -s          # corpus evaluation (numbers above)
-.venv/bin/python benchmarks/run_bench.py --quick          # 1,000 entries
-.venv/bin/python benchmarks/run_bench.py --entries 10000  # 10,000 entries
+.venv/bin/python benchmarks/run_bench.py --entries 10000 --json-out benchmarks/baseline_v1.json
+```
+
+Rerun the quality corpus:
+
+```bash
+.venv/bin/pytest tests/quality -q -s
 ```
 
 ## Quality corpus and retrieval target
@@ -247,18 +266,20 @@ simply makes CI green is not accepted without review.
 
 ```bash
 .venv/bin/python benchmarks/generate_corpus.py   # regenerate corpus_v1.json
-.venv/bin/python benchmarks/run_bench.py         # retrieval + fault baseline
+.venv/bin/python benchmarks/run_bench.py --entries 10000 --json-out benchmarks/baseline_v1.json
 ```
 
 `run_bench` generates a synthetic 10,000-entry corpus (or fewer with
-`--quick`) and concurrent clients, and reports the hardware and query
-distribution. The initial target is p95 bounded FTS search below 250 ms at 10
-concurrent clients on a typical developer workstation; as of 2026-11-11 the
-target is met at the measured sizes (see "Measured baseline" above) and the
-number stays informational, never a CI gate. Ordinary CI runs
-deterministic query-plan and bounded-work checks, not flaky shared runner
-wall-clock gates, and a 50-client concurrent correctness and busy-timeout
-test.
+`--quick`) and concurrent clients, reports the hardware and query
+distribution, and writes a machine-readable report when `--json-out` is set.
+The JSON is written atomically with mode 0600 and records environment
+metadata, query mix, per-mode latency percentiles, response bytes, database
+size and correctness. The target is p95 bounded FTS search below 250 ms at 10
+concurrent clients on a typical idle developer workstation. The current shared
+host measured above that target (see "Measured baseline" above). The number
+stays informational, never a CI gate. Ordinary CI runs deterministic
+query-plan and bounded-work checks, not flaky shared-runner wall-clock gates,
+and a 50-client concurrent correctness and busy-timeout test.
 
 Live end-to-end model evaluation (no memory versus fixed read-only memory
 snapshots on the same task set) is opt-in and budgeted; it uses held-out

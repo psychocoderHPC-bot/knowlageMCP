@@ -1,0 +1,62 @@
+{
+  "avg_response_bytes": 1904.7,
+  "clients": [
+    1,
+    10
+  ],
+  "command": [
+    "benchmarks/run_bench.py",
+    "--entries",
+    "10000",
+    "--json-out",
+    "benchmarks/baseline_v1.json"
+  ],
+  "corpus_version": "generated",
+  "correctness_ok": true,
+  "cpu_count": 14,
+  "cpu_model": "Intel(R) Core(TM) Ultra 7 255U",
+  "db_bytes": 20021248,
+  "entries": 10000,
+  "generated_at": "2026-11-12T15:41:48+00:00",
+  "latency": {
+    "10_clients": {
+      "count": 500,
+      "max": 455.077,
+      "mean": 95.624,
+      "p50": 37.8,
+      "p95": 339.021,
+      "p99": 430.272
+    },
+    "1_client": {
+      "count": 50,
+      "max": 40.866,
+      "mean": 20.991,
+      "p50": 15.756,
+      "p95": 38.9,
+      "p99": 40.866
+    },
+    "warmup": {
+      "count": 20,
+      "max": 32.349,
+      "mean": 20.473,
+      "p50": 18.593,
+      "p95": 30.901,
+      "p99": 32.349
+    }
+  },
+  "max_response_bytes": 4388,
+  "notes": "Informational reference baseline; timings are not a CI gate and vary with host load.",
+  "p95_target_ms": 250.0,
+  "package_version": "0.1.0",
+  "platform": "Linux-6.17.0-1033-oem-x86_64-with-glibc2.39",
+  "python_implementation": "CPython",
+  "python_version": "3.12.3",
+  "query_mix": {
+    "broad": 1,
+    "identifier": 25,
+    "no_answer": 8,
+    "phrase": 16
+  },
+  "seed": 7,
+  "sqlite_version": "3.45.1"
+}

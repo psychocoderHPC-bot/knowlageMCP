@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.resources
+import ipaddress
 import json
 import logging
 import os
@@ -135,6 +136,19 @@ class EventBus:
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subscribers)
+
+
+def _is_loopback_bind(host: str) -> bool:
+    """Return whether a configured bind address only serves loopback traffic."""
+    candidate = host.strip()
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    if candidate.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        return False
 
 
 class KnowledgeService:
@@ -535,6 +549,19 @@ class KnowledgeService:
                 add("listener", True, f"accepting connections at {host}:{port}")
         except OSError as exc:
             add("listener", False, f"{host}:{port} not accepting connections ({exc})")
+
+        if _is_loopback_bind(host):
+            add("listener_exposure", True, "loopback only")
+        else:
+            allowed_hosts = ", ".join(self.config.server.allowed_hosts) or "(none)"
+            allowed_origins = ", ".join(self.config.server.allowed_origins) or "(none)"
+            add(
+                "listener_exposure",
+                True,
+                f"WARNING: bound to {host}; require firewall, TLS or a trusted tunnel, "
+                f"and an exact allowed_hosts list; allowed_hosts=[{allowed_hosts}], "
+                f"allowed_origins=[{allowed_origins}]",
+            )
 
         socket_path = Path(self.config.storage.runtime_socket)
         try:

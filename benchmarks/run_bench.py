@@ -12,6 +12,7 @@ small (1000 entries); the default is 10000.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -35,6 +36,7 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 from generate_corpus import generate_entries  # noqa: E402
 
+from knowlage_mcp import __version__  # noqa: E402
 from knowlage_mcp.config import Config, StorageConfig, resolve_paths  # noqa: E402
 from knowlage_mcp.db import Database  # noqa: E402
 from knowlage_mcp.evidence import EvidenceStore  # noqa: E402
@@ -111,6 +113,33 @@ def _cpu_model() -> str:
     except OSError:
         pass
     return platform.processor() or "unknown"
+
+
+def _mode_report(stats: Stats) -> dict[str, float | int]:
+    return {
+        "count": stats.count,
+        "p50": round(stats.p50, 3),
+        "p95": round(stats.p95, 3),
+        "p99": round(stats.p99, 3),
+        "mean": round(stats.mean, 3),
+        "max": round(stats.maximum, 3),
+    }
+
+
+def _write_report(path: Path, report: dict[str, Any]) -> None:
+    """Write ``report`` atomically as JSON with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -290,7 +319,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--entries", type=int, default=None, help="entries to generate (default 10000)")
     parser.add_argument("--seed", type=int, default=7, help="deterministic seed (default 7)")
     parser.add_argument("--quick", action="store_true", help="CI mode: 1000 entries and fewer queries")
+    parser.add_argument(
+        "--json-out",
+        default=None,
+        metavar="PATH",
+        help="write a machine-readable JSON report atomically (mode 0600); '-' is rejected",
+    )
     args = parser.parse_args(argv)
+    if args.json_out == "-":
+        parser.error("--json-out requires a file path; JSON on stdout would corrupt the report")
 
     entries = args.entries if args.entries is not None else (1000 if args.quick else 10_000)
     per_client = 30 if args.quick else 50
@@ -346,6 +383,39 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             failures = one.failures + ten.failures
+            measured = one.count + ten.count
+            avg_bytes = (
+                (one.mean_bytes * one.count + ten.mean_bytes * ten.count) / measured if measured else 0.0
+            )
+            report: dict[str, Any] = {
+                "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "package_version": __version__,
+                "python_version": platform.python_version(),
+                "python_implementation": platform.python_implementation(),
+                "sqlite_version": sqlite3.sqlite_version,
+                "platform": platform.platform(),
+                "cpu_model": _cpu_model(),
+                "cpu_count": os.cpu_count(),
+                "entries": entries,
+                "seed": args.seed,
+                "corpus_version": "generated",
+                "clients": [1, 10],
+                "query_mix": dict(sorted(distribution.items())),
+                "latency": {
+                    "warmup": _mode_report(warmup),
+                    "1_client": _mode_report(one),
+                    "10_clients": _mode_report(ten),
+                },
+                "avg_response_bytes": round(avg_bytes, 1),
+                "max_response_bytes": max(one.max_bytes, ten.max_bytes),
+                "db_bytes": db_bytes,
+                "correctness_ok": not failures,
+                "p95_target_ms": P95_TARGET_MS,
+                "command": list(sys.argv),
+            }
+            if args.json_out is not None:
+                _write_report(Path(args.json_out), report)
+
             if failures:
                 print(f"correctness failures: {len(failures)}")
                 for failure in dict.fromkeys(failures):

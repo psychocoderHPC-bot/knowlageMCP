@@ -36,10 +36,25 @@ for AI coding agents with a stdio MCP bridge.
 
 ## Validation
 
+Run the one-command clean-environment check before handing off:
+
+```bash
+./scripts/check.sh
+```
+
+It creates `.venv` when missing, installs `-e '.[dev]'`, and runs lint,
+formatting, typing, the full test suite, the quality corpus, REUSE lint, a
+package build and a wheel smoke test. `SKIP_BUILD=1 ./scripts/check.sh` skips
+the build and smoke test. `pytest` needs the dev extra
+(`pip install -e '.[dev]'`), which the script installs.
+
+Optional manual steps:
+
 ```bash
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
 .venv/bin/mypy src/knowlage_mcp
-.venv/bin/pytest tests/unit -q
+.venv/bin/pytest -q
+.venv/bin/pytest tests/quality -q -s
 .venv/bin/reuse lint
 ```
