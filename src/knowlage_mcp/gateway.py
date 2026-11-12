@@ -13,7 +13,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import shutil
 import signal
 import time
 import uuid
@@ -31,8 +30,9 @@ from pydantic import ValidationError
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import __version__
+from . import PROTOCOL_VERSION, __version__
 from .admin import AdminServer
+from .backup import prune_backups
 from .config import Config, load_config, validate_config
 from .db import Database, DatabaseLockedError, lock_file
 from .evidence import EvidenceStore
@@ -49,6 +49,7 @@ from .policy import readable_namespaces
 from .protocol import (
     HEADER_ACTOR_HANDLE,
     HEADER_EVIDENCE_NAME,
+    HEADER_PROTOCOL,
     ROUTE_CLOSE,
     ROUTE_ENROLLMENT,
     ROUTE_EVIDENCE,
@@ -63,6 +64,7 @@ from .protocol import (
     MentorHttpRequest,
     RegisterRequest,
     parse_bearer,
+    version_compatible,
 )
 from .service import KnowledgeService
 
@@ -426,34 +428,29 @@ def require_auth(request: Request) -> AuthContext:
 AuthDep = Annotated[AuthContext, Depends(require_auth)]
 
 
+def require_protocol_header(request: Request) -> None:
+    """Validate an explicitly supplied protocol version; absence is allowed.
+
+    A missing header means an older client that predates negotiation, so it
+    continues to work. A present but incompatible or malformed value fails
+    before any request state changes.
+    """
+    value = request.headers.get(HEADER_PROTOCOL)
+    if value is None:
+        return
+    if not version_compatible(value):
+        shown = value.strip() or "<empty>"
+        raise ServiceError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"client protocol {shown} is not compatible with server protocol {PROTOCOL_VERSION}",
+            details={"client_protocol": value, "server_protocol": PROTOCOL_VERSION},
+        )
+
+
+ProtocolDep = Annotated[None, Depends(require_protocol_header)]
+
+
 # -- backup scheduler ------------------------------------------------------
-def _prune_backups(backup_dir: Path, keep_daily: int, keep_weekly: int) -> int:
-    """Keep the newest daily snapshots and one snapshot per ISO week."""
-    if not backup_dir.is_dir():
-        return 0
-    snapshots = sorted(
-        (path for path in backup_dir.glob("snapshot-*") if path.is_dir()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    keep: set[Path] = set(snapshots[: max(0, keep_daily)])
-    weekly: dict[tuple[int, int], Path] = {}
-    for path in snapshots:
-        week = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isocalendar()
-        key = (week.year, week.week)
-        if key not in weekly:
-            weekly[key] = path
-    for key in sorted(weekly, reverse=True)[: max(0, keep_weekly)]:
-        keep.add(weekly[key])
-    removed = 0
-    for path in snapshots:
-        if path in keep:
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-        removed += 1
-    return removed
-
-
 async def _backup_loop(service: KnowledgeService) -> None:
     """Create one backup per day while the gateway runs. Never crashes."""
     config = service.config
@@ -463,8 +460,8 @@ async def _backup_loop(service: KnowledgeService) -> None:
             continue
         try:
             result = await asyncio.to_thread(service.backup.create)
-            removed = await asyncio.to_thread(
-                _prune_backups,
+            pruned = await asyncio.to_thread(
+                prune_backups,
                 Path(config.storage.backup_dir),
                 config.backup.keep_daily,
                 config.backup.keep_weekly,
@@ -472,7 +469,7 @@ async def _backup_loop(service: KnowledgeService) -> None:
             logger.info(
                 "scheduled backup created path=%s pruned=%s",
                 result.get("path"),
-                removed,
+                len(pruned["removed"]),
             )
         except asyncio.CancelledError:
             raise
@@ -559,7 +556,7 @@ def create_app(config: Config, service: KnowledgeService) -> FastAPI:
         )
 
     @app.post(ROUTE_REGISTER)
-    async def bridge_register(request: Request) -> JSONResponse:
+    async def bridge_register(request: Request, _: ProtocolDep) -> JSONResponse:
         try:
             body = RegisterRequest.model_validate(await request.json())
         except ValidationError as exc:
@@ -620,7 +617,7 @@ def create_app(config: Config, service: KnowledgeService) -> FastAPI:
         return JSONResponse(CloseResponse(closed=bool(result.get("closed", True))).model_dump(mode="json"))
 
     @app.post(ROUTE_TOOLS)
-    async def bridge_tool(tool: str, request: Request, auth: AuthDep) -> JSONResponse:
+    async def bridge_tool(tool: str, request: Request, _: ProtocolDep, auth: AuthDep) -> JSONResponse:
         if tool not in ALL_TOOL_NAMES or tool not in TOOL_ARG_MODELS:
             return JSONResponse(
                 _envelope_error(ErrorCode.INVALID_ARGUMENT, f"unknown tool: {tool}"),

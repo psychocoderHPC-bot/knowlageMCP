@@ -10,6 +10,8 @@ import httpx2
 import pytest
 
 from conftest import RunningGateway, free_port
+from knowlage_mcp import PROTOCOL_VERSION
+from knowlage_mcp.protocol import HEADER_PROTOCOL
 
 pytestmark = pytest.mark.integration
 
@@ -125,6 +127,80 @@ def test_host_and_origin_rejection(gateway_server: RunningGateway) -> None:
     assert origin.status_code == 403
     assert host.json()["ok"] is False
     assert origin.json()["ok"] is False
+
+
+def test_compatible_protocol_header_is_accepted(gateway_server: RunningGateway) -> None:
+    with httpx2.Client(base_url=gateway_server.base_url) as client:
+        registered = client.post(
+            "/v1/bridge/register",
+            headers={HEADER_PROTOCOL: PROTOCOL_VERSION},
+            json={"mode": "root", "label": "protocol-test"},
+        )
+        assert registered.status_code == 200, registered.text
+        token = registered.json()["session_token"]
+        response = client.post(
+            "/v1/tools/search",
+            headers={**_auth(token), HEADER_PROTOCOL: PROTOCOL_VERSION},
+            json={"query": "x"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+
+
+def test_incompatible_protocol_major_is_rejected(gateway_server: RunningGateway) -> None:
+    major = int(PROTOCOL_VERSION.partition(".")[0])
+    incompatible = f"{major + 1}.0"
+    with httpx2.Client(base_url=gateway_server.base_url) as client:
+        token = _register(client)["session_token"]
+        response = client.post(
+            "/v1/tools/search",
+            headers={**_auth(token), HEADER_PROTOCOL: incompatible},
+            json={"query": "x"},
+        )
+        registered = client.post(
+            "/v1/bridge/register",
+            headers={HEADER_PROTOCOL: incompatible},
+            json={"mode": "root"},
+        )
+    assert response.status_code == 400
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert body["error"]["details"] == {
+        "client_protocol": incompatible,
+        "server_protocol": PROTOCOL_VERSION,
+    }
+    assert "not compatible" in body["error"]["message"]
+    assert "data" not in body
+    assert registered.status_code == 400
+    assert registered.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
+def test_malformed_protocol_header_is_rejected(gateway_server: RunningGateway) -> None:
+    with httpx2.Client(base_url=gateway_server.base_url) as client:
+        token = _register(client)["session_token"]
+        response = client.post(
+            "/v1/tools/search",
+            headers={**_auth(token), HEADER_PROTOCOL: "not-a-version"},
+            json={"query": "x"},
+        )
+    assert response.status_code == 400
+    body = response.json()
+    assert body["ok"] is False
+    assert body["error"]["code"] == "INVALID_ARGUMENT"
+    assert body["error"]["details"]["client_protocol"] == "not-a-version"
+
+
+def test_absent_protocol_header_is_accepted(gateway_server: RunningGateway) -> None:
+    with httpx2.Client(base_url=gateway_server.base_url) as client:
+        token = _register(client)["session_token"]
+        response = client.post(
+            "/v1/tools/search",
+            headers=_auth(token),
+            json={"query": "x"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
 
 
 def test_oversized_body_is_rejected(gateway_server: RunningGateway) -> None:

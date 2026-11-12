@@ -27,6 +27,15 @@ expected impact. We aim to acknowledge reports within five working days.
 - Retrieved memory is data, not instructions. It cannot grant permissions,
   override the current user request, or authorize tool execution.
 
+## Administrative surface
+
+The Unix-domain admin socket is created with mode 0600 and rejects peers whose
+uid differs from the service owner. Access is by design equivalent to operator
+shell access: through it the operator can export and import to operator-chosen
+paths and create, verify, or restore backups. The agent-facing TCP/MCP surface
+never exposes filesystem paths, SQL, backup destinations, or administrative
+commands.
+
 ## Secrets
 
 Session credentials are opaque 32-byte random values. Only their SHA-256 hash is
@@ -34,6 +43,25 @@ stored. They are held in bridge memory and are never returned by MCP tools or
 written to logs. Uploaded evidence is scanned for common credential patterns and
 redacted before storage. Redaction is best effort, never a guarantee: do not
 upload secrets in the first place.
+
+## Dependency vulnerability policy
+
+CI runs `pip-audit` against the installed dependency set in an advisory job.
+Every reported finding is triaged before merge for reachability from
+knowlageMCP code, severity, exploitability in the supported deployment, and
+availability of a fixed or pinned version. The decision and its evidence are
+recorded in the pull request or `CHANGELOG.md`; findings are never silently
+ignored.
+
+High or critical findings with a reachable path are fixed, upgraded, or pinned
+within 30 days. Findings that are unreachable, dev-only, or mitigated by the
+host-only deployment are documented as accepted with a re-check date and the
+reason. A finding without a fix stays tracked until a fix exists or the
+affected dependency is removed.
+
+`reuse lint` checks SPDX and license metadata for files in this repository. It
+does not establish redistribution compatibility for third-party dependencies;
+dependency license review is separate from the vulnerability triage above.
 
 ## Supported versions
 

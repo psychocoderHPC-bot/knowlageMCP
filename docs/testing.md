@@ -14,6 +14,7 @@ tests/
   integration/           real temporary SQLite, real HTTP transports
   security/              security-boundary regression tests
   fixtures/              synthetic, versioned inputs (no real operational data)
+    export_v1.jsonl      golden version 1 JSONL export-format fixture
 benchmarks/
   generate_corpus.py     builds the labelled retrieval corpus
   run_bench.py           runs retrieval and fault benchmarks
@@ -23,6 +24,21 @@ benchmarks/
 Markers: `integration` (real transports or processes), `security`
 (boundary regressions), `slow` (more than a few seconds). All tests run with
 `tmp_path` only, no network, no shared state, and no paid API access.
+
+## Inventory
+
+The current suite has 200 tests:
+
+| Layer | Tests |
+|---|---|
+| `tests/unit` | 121 |
+| `tests/integration` | 35 |
+| `tests/security` | 40 |
+| `tests/quality` | 4 |
+
+Fixtures such as `tests/fixtures/export_v1.jsonl` are inputs, not tests. The
+counts are the observed result of a full `pytest -q` run; update them when the
+suite changes.
 
 ## Running
 
@@ -51,6 +67,28 @@ venv outside the tree.
 - Limits: rate and budget limiting with a fake clock; no real sleeps. The
   global request bound is covered by a unit test that advances an injectable
   clock to prove refill over time.
+- Backup retention: synthetic snapshot directories with controlled UTC
+  timestamps and identifiers prove daily and ISO-week retention, per-day and
+  per-week selection, newest-snapshot protection, dry-run behavior,
+  symlink refusal, and rejection of negative limits.
+- Export format: `tests/fixtures/export_v1.jsonl` is imported (dry-run and
+  real), asserted to stay candidate/unverified with its source preserved, then
+  exported and re-imported to prove header schema version, stable entry and
+  revision identifiers, and idempotent skips without duplicates.
+- Reload robustness: an invalid TOML or invalid configuration raises
+  `ServiceError` without changing the service or any submodule configuration,
+  and a simulated failure during the swap restores every holder to the old
+  configuration.
+- Import robustness: path-traversal references, non-object records,
+  non-dict revisions, bad namespaces or entry IDs, bad tags/scope, oversized
+  claims, and unknown record types count as `malformed` and skip only the
+  affected record; the transaction still commits valid revisions. Revisions
+  whose source lifecycle or evidence class is stronger than the import trust
+  rule are counted as `downgraded` while still being stored as
+  candidate/unverified.
+- Protocol negotiation: the compatibility matrix accepts the current major
+  version and newer minors, and rejects older majors, empty strings,
+  whitespace, and malformed versions.
 
 ## Integration layer
 

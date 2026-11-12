@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     reload_parser = sub.add_parser("reload", help="atomically reload the gateway configuration")
     _add_json(reload_parser)
 
-    backup = sub.add_parser("backup", help="create, verify, or restore snapshots")
+    backup = sub.add_parser("backup", help="create, verify, restore, or prune snapshots")
     backup_sub = backup.add_subparsers(dest="backup_command", required=True)
     _add_json(backup_sub.add_parser("create", help="create a snapshot"))
     verify = backup_sub.add_parser("verify", help="verify a snapshot")
@@ -126,6 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("snapshot")
     restore.add_argument("--destination", required=True)
     _add_json(restore)
+    prune = backup_sub.add_parser("prune", help="prune snapshots using the retention policy")
+    prune.add_argument("--keep-daily", type=int, default=None, help="daily snapshots to keep")
+    prune.add_argument("--keep-weekly", type=int, default=None, help="ISO-weekly snapshots to keep")
+    prune.add_argument("--dry-run", action="store_true", help="report removals without deleting")
+    _add_json(prune)
 
     export = sub.add_parser("export", help="export JSONL")
     export.add_argument("--namespace", default=None)
@@ -358,6 +363,25 @@ def _dispatch(args: argparse.Namespace) -> int:
             _emit(client.call("backup.create"), args.json)
         elif args.backup_command == "verify":
             _emit(client.call("backup.verify", {"path": args.snapshot}), args.json)
+        elif args.backup_command == "prune":
+            data = client.call(
+                "backup.prune",
+                {
+                    "keep_daily": args.keep_daily,
+                    "keep_weekly": args.keep_weekly,
+                    "dry_run": bool(args.dry_run),
+                },
+            )
+            if args.json:
+                _emit(data, True)
+            else:
+                print(f"{'dry_run':<18} {data.get('dry_run', '-')}")
+                print(f"{'keep_daily':<18} {data.get('keep_daily', '-')}")
+                print(f"{'keep_weekly':<18} {data.get('keep_weekly', '-')}")
+                print(f"{'kept':<18} {len(data.get('kept', []))}")
+                print(f"{'removed':<18} {len(data.get('removed', []))}")
+                for removed in data.get("removed", []):
+                    print(f"  removed {removed}")
         else:
             data = client.call(
                 "backup.restore",

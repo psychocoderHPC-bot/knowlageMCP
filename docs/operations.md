@@ -170,6 +170,7 @@ corrections. Operator-confirmed preferences can be published directly with
 knowlageMCP-gatewayctl backup create
 knowlageMCP-gatewayctl backup verify SNAP
 knowlageMCP-gatewayctl backup restore SNAP --destination DIR
+knowlageMCP-gatewayctl backup prune [--keep-daily N] [--keep-weekly N] [--dry-run] [--json]
 ```
 
 - `create` uses SQLite's online backup API and writes a snapshot plus a
@@ -179,12 +180,22 @@ knowlageMCP-gatewayctl backup restore SNAP --destination DIR
 - `restore SNAP --destination DIR` restores into a separate directory. It
   refuses to overwrite a non-empty destination, and it re-applies the deletion
   ledger so forgotten content does not resurrect.
+- `prune` applies the configured retention policy explicitly. It keeps the
+  newest snapshot for each of the most recent `--keep-daily` days (default
+  `backup.keep_daily`, 7) and the newest snapshot for each of the most recent
+  `--keep-weekly` ISO weeks (default `backup.keep_weekly`, 4). The newest
+  snapshot is always kept even when both limits are zero. Snapshot directories
+  are recognised by the UTC timestamp in `snapshot-<timestamp>-<uuid>`; a
+  symlinked snapshot directory is ignored and never removed. `--dry-run`
+  reports the would-be removals without deleting anything, and `--json` emits
+  the removed and kept paths. Negative limits fail with `INVALID_ARGUMENT`
+  (exit 4).
 
-Retention caveat: scheduled backups keep the configured number of daily and
-weekly snapshots, and backups can retain content that was forgotten later.
-Prune old snapshots explicitly if you need bounded retention. Backups are on
-the same disk and are not protection against disk loss. No forensic erasure
-from SSDs or external backups is claimed.
+The scheduler calls the same pruning helper after each scheduled snapshot.
+Retention cannot erase content that was forgotten between snapshots and then
+captured by an older snapshot, and backups on the same disk are not protection
+against disk loss. No forensic erasure from SSDs or external backups is
+claimed.
 
 ## Export and import
 

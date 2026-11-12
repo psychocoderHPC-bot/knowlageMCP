@@ -20,3 +20,11 @@ path = ["benchmarks/corpus_v1.json"]
 precedence = "closest"
 SPDX-FileCopyrightText = "2026 René Widera"
 SPDX-License-Identifier = "ISC"
+
+# JSONL cannot carry SPDX comment headers; this annotation covers only the
+# golden version 1 export-format fixture.
+[[annotations]]
+path = ["tests/fixtures/export_v1.jsonl"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 René Widera"
+SPDX-License-Identifier = "ISC"

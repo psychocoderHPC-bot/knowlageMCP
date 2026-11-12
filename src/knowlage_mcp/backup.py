@@ -8,12 +8,13 @@ import contextlib
 import hashlib
 import json
 import os
-import secrets
+import re
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,12 @@ from .policy import now_from
 _MANIFEST_NAME = "manifest.json"
 _DB_NAME = "knowledge.sqlite3"
 _EVIDENCE_DIR = "evidence"
+#: Snapshot directory prefix and the compact UTC timestamp in its name.
+_SNAPSHOT_PREFIX = "snapshot-"
+_SNAPSHOT_TIMESTAMP = re.compile(
+    r"^snapshot-(\d{8}T\d{6}|\d{4}-\d{2}-\d{2}T\d{2}[:\-]\d{2}[:\-]\d{2}(?:\.\d+)?Z?)-",
+    re.ASCII,
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -114,9 +121,7 @@ class BackupManager:
             manifest_path = temporary / _MANIFEST_NAME
             manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             os.chmod(manifest_path, 0o600)
-            final = backup_dir / (
-                f"snapshot-{stamp}-{hashlib.sha256(iso(at).encode()).hexdigest()[:8]}-{secrets.token_hex(3)}"
-            )
+            final = backup_dir / f"{_SNAPSHOT_PREFIX}{stamp}-{uuid.uuid4().hex}"
             if final.exists():
                 raise ServiceError(ErrorCode.CONFLICT, "backup snapshot already exists")
             os.replace(temporary, final)
@@ -307,4 +312,99 @@ class BackupManager:
             raise
 
 
-__all__ = ["BackupManager"]
+def _snapshot_time(path: Path) -> datetime:
+    """Return the UTC time encoded in a snapshot name, falling back to mtime."""
+    match = _SNAPSHOT_TIMESTAMP.match(path.name)
+    if match is not None:
+        raw = match.group(1)
+        try:
+            if re.fullmatch(r"\d{8}T\d{6}", raw):
+                return datetime.strptime(raw, "%Y%m%dT%H%M%S").replace(tzinfo=UTC)
+            date_part, time_part = raw.split("T", 1)
+            normalized = raw.replace("Z", "+00:00")
+            if ":" in time_part or "-" in time_part:
+                normalized = f"{date_part}T{time_part.replace('-', ':')}".replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+
+
+def _snapshots(backup_dir: Path) -> list[tuple[Path, datetime]]:
+    """List real snapshot directories, newest first, without following symlinks."""
+    if backup_dir.is_symlink() or not backup_dir.is_dir():
+        return []
+    found: list[tuple[Path, datetime]] = []
+    for path in backup_dir.iterdir():
+        # ``is_dir`` follows symlinks; a symlinked snapshot is never a candidate.
+        if path.is_symlink() or not path.name.startswith(_SNAPSHOT_PREFIX):
+            continue
+        if not path.is_dir():
+            continue
+        try:
+            found.append((path, _snapshot_time(path)))
+        except OSError:
+            continue
+    found.sort(key=lambda item: (item[1], item[0].name), reverse=True)
+    return found
+
+
+def prune_backups(
+    backup_dir: Path,
+    keep_daily: int,
+    keep_weekly: int,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Apply daily and weekly retention to a snapshot directory.
+
+    One snapshot per day is kept for the ``keep_daily`` most recent days and
+    one snapshot per ISO week for the ``keep_weekly`` most recent weeks. The
+    newest snapshot is always kept, even when both limits are zero. Symlinked
+    snapshot directories are ignored and never removed. With ``dry_run`` the
+    would-be removal set is reported but nothing is deleted.
+    """
+    if keep_daily < 0 or keep_weekly < 0:
+        raise ServiceError(ErrorCode.INVALID_ARGUMENT, "keep_daily and keep_weekly must not be negative")
+    snapshots = _snapshots(Path(backup_dir))
+    keep: set[Path] = set()
+    if snapshots:
+        # Never delete the newest snapshot, regardless of the retention limits.
+        keep.add(snapshots[0][0])
+    days: set[date] = set()
+    for path, at in snapshots:
+        if len(days) >= keep_daily:
+            break
+        day = at.date()
+        if day in days:
+            continue
+        days.add(day)
+        keep.add(path)
+    weeks: set[tuple[int, int]] = set()
+    for path, at in snapshots:
+        if len(weeks) >= keep_weekly:
+            break
+        iso_week = at.isocalendar()
+        key = (iso_week.year, iso_week.week)
+        if key in weeks:
+            continue
+        weeks.add(key)
+        keep.add(path)
+    removed: list[Path] = []
+    for path, _at in snapshots:
+        if path in keep:
+            continue
+        removed.append(path)
+        if not dry_run:
+            shutil.rmtree(path)
+    return {
+        "removed": sorted(str(path) for path in removed),
+        "kept": sorted(str(path) for path in keep),
+        "dry_run": dry_run,
+        "keep_daily": keep_daily,
+        "keep_weekly": keep_weekly,
+    }
+
+
+__all__ = ["BackupManager", "prune_backups"]

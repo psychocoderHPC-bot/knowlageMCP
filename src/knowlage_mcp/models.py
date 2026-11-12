@@ -283,6 +283,11 @@ class SearchRequest(_RequestModel):
     cursor: str | None = None
 
 
+#: Label for the byte-derived token number. It is an estimate, never a count
+#: produced by a model tokenizer, so the method travels with every response.
+TOKEN_ESTIMATE_METHOD = "utf8_bytes_div_4 (estimate, not a tokenizer count)"
+
+
 class SearchResult(_ResponseModel):
     entry_id: str
     revision_id: str
@@ -300,6 +305,7 @@ class SearchResult(_ResponseModel):
     warnings: tuple[str, ...] = ()
     contradictions: tuple[str, ...] = ()
     duplicate_of: str | None = None
+    selection_reasons: tuple[str, ...] = ()
 
 
 class SearchResponse(_ResponseModel):
@@ -308,6 +314,8 @@ class SearchResponse(_ResponseModel):
     truncated: bool = False
     next_cursor: str | None = None
     approx_bytes: int = 0
+    estimated_tokens: int = 0
+    token_estimate_method: str = TOKEN_ESTIMATE_METHOD
 
 
 class ReviewView(_ResponseModel):
@@ -465,6 +473,8 @@ class ContextBundle(_ResponseModel):
     namespaces: tuple[str, ...] = ()
     approx_bytes: int = 0
     truncated: bool = False
+    estimated_tokens: int = 0
+    token_estimate_method: str = TOKEN_ESTIMATE_METHOD
 
 
 class TaskOutcome(_ResponseModel):
@@ -566,6 +576,7 @@ class ServiceError(Exception):
 
 
 __all__ = [
+    "TOKEN_ESTIMATE_METHOD",
     "AdminEntryView",
     "ContextBundle",
     "Delegation",

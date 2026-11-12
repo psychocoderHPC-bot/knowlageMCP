@@ -32,6 +32,8 @@ ROUTE_TOOLS = f"{HTTP_PREFIX}/tools/{{tool}}"
 HEADER_ACTOR_HANDLE = "X-Actor-Handle"
 #: Header naming an uploaded evidence object.
 HEADER_EVIDENCE_NAME = "X-Evidence-Name"
+#: Header carrying the client's bridge/MCP protocol version.
+HEADER_PROTOCOL = "X-Knowlage-Protocol"
 
 AUTH_SCHEME = "Bearer"
 
@@ -158,19 +160,19 @@ def error_envelope(exc: ServiceError) -> ToolEnvelope:
 def version_compatible(client_version: str) -> bool:
     """Return whether a client protocol version is understood by this gateway.
 
-    Compatibility is same major and client minor not newer than the server
-    minor. Unknown or malformed values are rejected rather than guessed.
+    Compatibility is same-major. Minor releases within a major add fields but
+    do not change existing semantics, so an older or newer minor is accepted.
+    Unknown or malformed values are rejected rather than guessed.
     """
-    server_major, _, server_minor_text = PROTOCOL_VERSION.partition(".")
-    parts = client_version.split(".")
+    text = client_version.strip()
+    if not text:
+        return False
+    server_major, _, _ = PROTOCOL_VERSION.partition(".")
     try:
-        major = int(parts[0])
-        minor = int(parts[1]) if len(parts) > 1 else 0
+        parsed = [int(part) for part in text.split(".")]
     except ValueError:
         return False
-    if major != int(server_major):
-        return False
-    return minor <= int(server_minor_text)
+    return parsed[0] == int(server_major)
 
 
 def parse_bearer(header_value: str | None) -> str | None:
@@ -189,6 +191,7 @@ __all__ = [
     "AUTH_SCHEME",
     "HEADER_ACTOR_HANDLE",
     "HEADER_EVIDENCE_NAME",
+    "HEADER_PROTOCOL",
     "HTTP_PREFIX",
     "ROUTE_CLOSE",
     "ROUTE_ENROLLMENT",

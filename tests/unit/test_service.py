@@ -194,6 +194,60 @@ def test_config_reload_and_show(env: ServiceEnv, tmp_path: Path) -> None:
     assert "[server]" in shown
 
 
+def _config_holders(env: ServiceEnv):
+    service = env.service
+    return (service, service.identity, service.knowledge, service.retrieval, service.review, service.backup)
+
+
+@pytest.mark.parametrize("text", ["[server]\nport = 0\n", "[server\nport = 2230\n"])
+def test_reload_invalid_config_is_all_or_nothing(env: ServiceEnv, tmp_path: Path, text: str) -> None:
+    path = tmp_path / "invalid.toml"
+    path.write_text(text, encoding="utf-8")
+    before = [holder.config for holder in _config_holders(env)]
+
+    with pytest.raises(ServiceError) as excinfo:
+        env.service.reload_config(path)
+    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+
+    assert [holder.config for holder in _config_holders(env)] == before
+    assert all(holder.config is old for holder, old in zip(_config_holders(env), before, strict=True))
+
+
+def test_reload_swap_failure_restores_every_holder(
+    env: ServiceEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FlakyHolder:
+        def __init__(self, config) -> None:
+            self._config = config
+            self.set_calls = 0
+
+        @property
+        def config(self):
+            return self._config
+
+        @config.setter
+        def config(self, value) -> None:
+            self.set_calls += 1
+            if self.set_calls == 1:
+                raise RuntimeError("simulated swap failure")
+            self._config = value
+
+    replacement = env.config.model_copy(deep=True)
+    replacement.server.port = env.config.server.port + 1
+    path = tmp_path / "reload.toml"
+    write_config_atomic(path, replacement)
+
+    flaky = FlakyHolder(env.config)
+    monkeypatch.setattr(env.service, "backup", flaky)
+    before = [holder.config for holder in _config_holders(env)]
+
+    with pytest.raises(RuntimeError, match="simulated swap failure"):
+        env.service.reload_config(path)
+
+    assert [holder.config for holder in _config_holders(env)] == before
+    assert all(holder.config is old for holder, old in zip(_config_holders(env), before, strict=True))
+
+
 def test_jsonl_export_import_roundtrip_and_idempotency(env: ServiceEnv, tmp_path: Path) -> None:
     _record(env, "transfer probe one", title="one")
     _record(env, "transfer probe two", title="two")
@@ -245,38 +299,124 @@ def test_jsonl_export_import_roundtrip_and_idempotency(env: ServiceEnv, tmp_path
         other.db.close()
 
 
-def test_jsonl_import_rejects_path_traversal(env: ServiceEnv, tmp_path: Path) -> None:
-    payload = {
+def _import_header() -> dict:
+    return {
         "type": "header",
         "schema_version": 1,
         "app_version": "0.1.0",
         "created_at": "2026-01-01T00:00:00.000000Z",
     }
-    entry = {
+
+
+def _import_entry(entry_id: str, revisions: list, *, namespace: str = "shared") -> dict:
+    return {
         "type": "entry",
-        "entry_id": "ent_evil",
-        "namespace": "shared",
+        "entry_id": entry_id,
+        "namespace": namespace,
         "created_at": "2026-01-01T00:00:00.000000Z",
         "created_by_agent_id": "import",
-        "revisions": [
-            {
-                "revision_id": "rev_evil",
-                "kind": "observation",
-                "title": "evil",
-                "claim": "evil",
-                "observed_at": "2026-01-01T00:00:00.000000Z",
-                "author_agent_id": "import",
-                "author_root_id": "import",
-                "created_at": "2026-01-01T00:00:00.000000Z",
-                "sources": [{"kind": "log", "storage_path": "../escape"}],
-            }
-        ],
+        "revisions": revisions,
     }
-    path = tmp_path / "evil.jsonl"
-    path.write_text(json.dumps(payload) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
-    with pytest.raises(ServiceError) as excinfo:
-        env.service.import_jsonl(path)
-    assert excinfo.value.code is ErrorCode.INVALID_ARGUMENT
+
+
+def _import_revision(revision_id: str, claim: str, **overrides) -> dict:
+    revision = {
+        "revision_id": revision_id,
+        "kind": "observation",
+        "title": claim,
+        "claim": claim,
+        "observed_at": "2026-01-01T00:00:00.000000Z",
+        "author_agent_id": "import",
+        "author_root_id": "import",
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "sources": [],
+    }
+    revision.update(overrides)
+    return revision
+
+
+def test_jsonl_import_skips_path_traversal_revision_and_commits(env: ServiceEnv, tmp_path: Path) -> None:
+    good = _import_revision("rev_good", "valid revision")
+    bad = _import_revision(
+        "rev_bad", "traversal revision", sources=[{"kind": "log", "storage_path": "../escape"}]
+    )
+    entry = _import_entry("ent_mixed", [good, bad])
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(json.dumps(_import_header()) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+
+    result = env.service.import_jsonl(path)
+
+    assert result["created_entries"] == 1
+    assert result["created_revisions"] == 1
+    assert result["malformed"] == 1
+    assert result["conflicts"] == 0
+    assert result["creates"] == result["created_revisions"]
+    connection = env.db.connect()
+    assert connection.execute("SELECT 1 FROM entries WHERE entry_id = 'ent_mixed'").fetchone() is not None
+    assert (
+        connection.execute("SELECT 1 FROM entry_revisions WHERE revision_id = 'rev_good'").fetchone()
+        is not None
+    )
+    assert (
+        connection.execute("SELECT 1 FROM entry_revisions WHERE revision_id = 'rev_bad'").fetchone() is None
+    )
+
+
+def test_jsonl_import_reports_downgraded_trust(env: ServiceEnv, tmp_path: Path) -> None:
+    revision = _import_revision(
+        "rev_downgraded",
+        "published and verified at the source",
+        lifecycle="published",
+        evidence_class="verified",
+    )
+    entry = _import_entry("ent_downgraded", [revision])
+    path = tmp_path / "downgraded.jsonl"
+    path.write_text(json.dumps(_import_header()) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+
+    result = env.service.import_jsonl(path)
+
+    assert result["created_revisions"] == 1
+    assert result["downgraded"] == 1
+    assert result["malformed"] == 0
+    row = (
+        env.db.connect()
+        .execute("SELECT lifecycle, evidence_class FROM entry_revisions WHERE revision_id = 'rev_downgraded'")
+        .fetchone()
+    )
+    assert row["lifecycle"] == "candidate"
+    assert row["evidence_class"] == "unverified"
+
+
+def test_jsonl_import_counts_structural_errors_as_malformed(env: ServiceEnv, tmp_path: Path) -> None:
+    entry = _import_entry(
+        "ent_structural",
+        [
+            "not-a-dict",
+            _import_revision("", "missing revision id"),
+            _import_revision("rev_tags", "bad tags", tags="not-a-list"),
+            _import_revision("rev_ok", "survives malformed neighbours"),
+        ],
+    )
+    path = tmp_path / "structural.jsonl"
+    path.write_text(
+        json.dumps(_import_header())
+        + "\n"
+        + json.dumps({"type": "unknown-record"})
+        + "\n"
+        + json.dumps(entry)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = env.service.import_jsonl(path)
+
+    assert result["created_revisions"] == 1
+    assert result["malformed"] == 4
+    assert result["conflicts"] == 0
+    assert (
+        env.db.connect().execute("SELECT 1 FROM entry_revisions WHERE revision_id = 'rev_ok'").fetchone()
+        is not None
+    )
 
 
 def test_backup_verify_restore_and_forgotten_stays_forgotten(env: ServiceEnv, tmp_path: Path) -> None:

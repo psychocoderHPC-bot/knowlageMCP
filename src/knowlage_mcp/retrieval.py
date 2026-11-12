@@ -11,7 +11,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 from .config import Config
 from .db import Database, iso, parse_iso
@@ -55,6 +55,57 @@ _EVIDENCE_STRENGTH = {
     EvidenceClass.REPRODUCED: 3,
     EvidenceClass.OPERATOR_CONFIRMED: 4,
 }
+
+#: A result may state at most this many selection reasons. The set is a short
+#: explanation, not a ranking trace.
+_MAX_SELECTION_REASONS = 5
+
+_ResponseT = TypeVar("_ResponseT", SearchResponse, ContextBundle)
+
+
+def _bounded_reasons(reasons: Iterable[str], *, limit: int = _MAX_SELECTION_REASONS) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(reasons))[:limit]
+
+
+def _identifier_tokens(value: str) -> set[str]:
+    """Casefold identifier-shaped tokens: punctuation or letters plus digits."""
+    found: set[str] = set()
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_.:/\\-]*", value):
+        token = match.group(0)
+        has_marker = any(char in token for char in "_.:/\\-")
+        mixed = any(char.isalpha() for char in token) and any(char.isdigit() for char in token)
+        if has_marker or mixed:
+            found.add(token.casefold())
+    return found
+
+
+def _exact_identifier_match(query: str, candidate: dict[str, Any]) -> bool:
+    wanted = _identifier_tokens(query)
+    if not wanted:
+        return False
+    haystack = f"{candidate['title']} {candidate['claim']}"
+    return bool(wanted & _identifier_tokens(haystack))
+
+
+def _with_token_estimate(model: _ResponseT) -> _ResponseT:
+    """Attach a byte-derived token estimate fixed to the serialized payload.
+
+    Iterating once or twice makes the number consistent with the payload that
+    actually includes ``estimated_tokens``; it is an estimate, not a tokenizer
+    count, and the response says so in ``token_estimate_method``.
+    """
+    estimate = 0
+    candidate = model
+    for _ in range(4):
+        candidate = model.model_copy(update={"estimated_tokens": estimate})
+        payload = json.dumps(
+            candidate.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        next_estimate = (len(payload) + 3) // 4
+        if next_estimate == estimate:
+            return candidate
+        estimate = next_estimate
+    return candidate.model_copy(update={"estimated_tokens": estimate})
 
 
 def tokenize(query: str) -> list[str]:
@@ -344,6 +395,8 @@ class RetrievalManager:
         candidates: Iterable[dict[str, Any]],
         filters: SearchFilters,
         include_candidates: bool,
+        *,
+        query: str,
     ) -> list[SearchResult]:
         candidate_list = list(candidates)
         allowed = self._lifecycle_allowed(filters, include_candidates)
@@ -380,6 +433,21 @@ class RetrievalManager:
                 warnings.append("low trust: candidate has not been reviewed")
             by_entry[candidate["entry_id"]] = candidate
             applicability[candidate["entry_id"]] = bucket
+            reasons: list[str] = []
+            if lifecycle == Lifecycle.PUBLISHED:
+                reasons.append("published")
+            if not filters.scope.is_empty():
+                reasons.append("scope matches query")
+            if _exact_identifier_match(query, candidate):
+                reasons.append("exact identifier match")
+            if candidate["rank"] is not None:
+                reasons.append("fts match")
+            if candidate["evidence_class"] is not EvidenceClass.UNVERIFIED:
+                reasons.append(f"evidence: {candidate['evidence_class'].value}")
+            if contradictions:
+                reasons.append("contradiction visible")
+            if lifecycle == Lifecycle.CANDIDATE:
+                reasons.append("candidate low trust")
             results.append(
                 SearchResult(
                     entry_id=candidate["entry_id"],
@@ -397,6 +465,7 @@ class RetrievalManager:
                     low_trust=lifecycle == Lifecycle.CANDIDATE,
                     warnings=tuple(warnings),
                     contradictions=contradictions,
+                    selection_reasons=_bounded_reasons(reasons),
                 )
             )
 
@@ -429,7 +498,14 @@ class RetrievalManager:
             if lineage_key in seen:
                 primary = seen[lineage_key]
                 note = f"duplicate lineage merged into {primary.entry_id}"
-                updated = primary.model_copy(update={"warnings": (*primary.warnings, note)})
+                updated = primary.model_copy(
+                    update={
+                        "warnings": (*primary.warnings, note),
+                        "selection_reasons": _bounded_reasons(
+                            (*primary.selection_reasons, "duplicate lineage merged")
+                        ),
+                    }
+                )
                 seen[lineage_key] = updated
                 index = kept.index(primary)
                 kept[index] = updated
@@ -475,7 +551,7 @@ class RetrievalManager:
             exact_phrase=filters.exact_phrase,
             limit=candidate_limit,
         )
-        ranked = self._rank(candidates.values(), filters, include_candidates)
+        ranked = self._rank(candidates.values(), filters, include_candidates, query=query)
         total = len(ranked)
         if offset > total:
             offset = total
@@ -500,12 +576,14 @@ class RetrievalManager:
             # cursor that cannot make progress. Callers may retry with a larger
             # budget or a narrower query.
             truncated = True
-        return SearchResponse(
-            results=tuple(selected),
-            total=total,
-            truncated=truncated,
-            next_cursor=next_cursor,
-            approx_bytes=approx_bytes,
+        return _with_token_estimate(
+            SearchResponse(
+                results=tuple(selected),
+                total=total,
+                truncated=truncated,
+                next_cursor=next_cursor,
+                approx_bytes=approx_bytes,
+            )
         )
 
     def search(self, session: SessionInfo, request: SearchRequest) -> SearchResponse:
@@ -573,11 +651,13 @@ class RetrievalManager:
             cursor=None,
             include_candidates=False,
         )
-        return ContextBundle(
-            results=response.results,
-            namespaces=tuple(sorted(readable)),
-            approx_bytes=response.approx_bytes,
-            truncated=response.truncated,
+        return _with_token_estimate(
+            ContextBundle(
+                results=response.results,
+                namespaces=tuple(sorted(readable)),
+                approx_bytes=response.approx_bytes,
+                truncated=response.truncated,
+            )
         )
 
     def get_entry(

@@ -36,7 +36,7 @@ from .mcp_server import (
     success,
 )
 from .models import EntryPayload, ErrorCode, ReviewFilters, Scope, SearchFilters, ServiceError
-from .protocol import HEADER_ACTOR_HANDLE, HEADER_EVIDENCE_NAME
+from .protocol import HEADER_ACTOR_HANDLE, HEADER_EVIDENCE_NAME, HEADER_PROTOCOL
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +120,17 @@ class BridgeBackend:
     ) -> tuple[int, Any]:
         attempt = 0
         while True:
+            # Announce the protocol on every request so the gateway can reject
+            # an incompatible client before any state changes.
+            request_headers = dict(headers) if headers else {}
+            request_headers.setdefault(HEADER_PROTOCOL, PROTOCOL_VERSION)
             try:
                 if raw is not None:
-                    response = await self._client.request(method, path, content=raw, headers=headers)
+                    response = await self._client.request(method, path, content=raw, headers=request_headers)
                 else:
-                    response = await self._client.request(method, path, json=json_body, headers=headers)
+                    response = await self._client.request(
+                        method, path, json=json_body, headers=request_headers
+                    )
             except httpx2.TransportError:
                 if attempt < retries:
                     attempt += 1

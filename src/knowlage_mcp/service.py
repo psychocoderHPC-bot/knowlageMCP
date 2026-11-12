@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION, SKILL_RESOURCE_NAME, SKILL_RESOURCE_URI, TOOL_NAMES, __version__
-from .backup import BackupManager
+from .backup import BackupManager, prune_backups
 from .config import (
     Config,
     config_dir,
@@ -144,6 +144,7 @@ class KnowledgeService:
         self._clock = clock
         self._monotonic = monotonic
         self._started = monotonic()
+        self._config_lock = threading.RLock()
         self._event_bus: EventBus | None = None
         self._bus_lock = threading.Lock()
         self.identity = IdentityManager(
@@ -640,6 +641,23 @@ class KnowledgeService:
     def backup_restore(self, path: str | Path, destination: str | Path) -> dict[str, Any]:
         return self.backup.restore(path, destination)
 
+    def backup_prune(
+        self,
+        keep_daily: int | None = None,
+        keep_weekly: int | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        daily = self.config.backup.keep_daily if keep_daily is None else int(keep_daily)
+        weekly = self.config.backup.keep_weekly if keep_weekly is None else int(keep_weekly)
+        if daily < 0 or weekly < 0:
+            raise self._json_error("keep_daily and keep_weekly must not be negative")
+        return prune_backups(
+            Path(self.config.storage.backup_dir),
+            daily,
+            weekly,
+            dry_run=bool(dry_run),
+        )
+
     # -- admin: index and config ----------------------------------------
     def index_rebuild(self) -> dict[str, Any]:
         return self.retrieval.index_rebuild()
@@ -652,17 +670,31 @@ class KnowledgeService:
         return show_config(self.config, redacted=redacted)
 
     def reload_config(self, path: str | Path | None = None) -> dict[str, Any]:
-        new_config = load_config(Path(path) if path is not None else None)
+        try:
+            new_config = load_config(Path(path) if path is not None else None)
+        except (OSError, ValueError) as exc:
+            raise ServiceError(ErrorCode.INVALID_ARGUMENT, f"failed to load config: {exc}") from exc
         problems = validate_config(new_config)
         if problems:
             raise ServiceError(ErrorCode.INVALID_ARGUMENT, "; ".join(problems))
-        changes = diff_keys(self.config, new_config)
-        self.config = new_config
-        self.identity.config = new_config
-        self.knowledge.config = new_config
-        self.retrieval.config = new_config
-        self.review.config = new_config
-        self.backup.config = new_config
+        holders = (
+            self,
+            self.identity,
+            self.knowledge,
+            self.retrieval,
+            self.review,
+            self.backup,
+        )
+        with self._config_lock:
+            changes = diff_keys(self.config, new_config)
+            snapshot = [(holder, holder.config) for holder in holders]
+            try:
+                for holder in holders:
+                    holder.config = new_config
+            except BaseException:
+                for holder, old_config in snapshot:
+                    holder.config = old_config
+                raise
         return {
             "reloaded": True,
             "changed_keys": sorted(changes),
@@ -872,19 +904,26 @@ class KnowledgeService:
         if not source.is_file():
             raise self._json_error("import path must be an existing file")
         records: list[dict[str, Any]] = []
+        malformed_lines = 0
         try:
             with source.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
+                for line in handle:
                     text = line.strip()
                     if not text:
                         continue
                     parsed = json.loads(text)
                     if not isinstance(parsed, dict):
-                        raise self._json_error(f"line {line_number} is not an object")
+                        malformed_lines += 1
+                        continue
                     records.append(parsed)
         except (OSError, ValueError) as exc:
             raise self._json_error("import file is not valid JSONL") from exc
-        if not records or records[0].get("type") != "header":
+        if not records:
+            raise self._json_error("import file is missing a header")
+        # The header may mark itself with ``type`` or ``kind``. Unknown
+        # top-level metadata keys (for example ``_license``) are ignored.
+        header = records[0]
+        if header.get("type") != "header" and header.get("kind") != "header":
             raise self._json_error("import file is missing a header")
         try:
             schema_version = int(records[0].get("schema_version", 0))
@@ -893,24 +932,64 @@ class KnowledgeService:
         if schema_version < 1 or schema_version > 1:
             raise self._json_error("unsupported import schema version")
 
+        def valid_namespace_name(name: str) -> bool:
+            return (
+                bool(name)
+                and name not in {".", ".."}
+                and not any(char in name for char in ("/", "\\", "\x00"))
+            )
+
+        def validate_revision(revision: Any) -> dict[str, Any] | None:
+            """Return the revision when structurally valid, otherwise ``None``.
+
+            Path-traversal references make one revision malformed rather than
+            aborting the whole import.
+            """
+            if not isinstance(revision, dict):
+                return None
+            revision_id = revision.get("revision_id")
+            if not isinstance(revision_id, str) or not revision_id.strip():
+                return None
+            tags = revision.get("tags") or []
+            scope = revision.get("scope") or {}
+            if not isinstance(tags, list) or not isinstance(scope, dict):
+                return None
+            sources = revision.get("sources") or []
+            if not isinstance(sources, list):
+                return None
+            for source_ref in sources:
+                if not isinstance(source_ref, dict):
+                    return None
+                for key in ("storage_path", "path"):
+                    if key in source_ref and not self._safe_relative(str(source_ref[key])):
+                        return None
+            claim_text = str(revision.get("claim", ""))
+            if len(claim_text.encode("utf-8")) > self.config.limits.claim_body_bytes:
+                return None
+            return revision
+
         at = self._now()
         counts = {
             "created_entries": 0,
             "created_revisions": 0,
             "skipped": 0,
             "conflicts": 0,
+            "malformed": malformed_lines,
+            "downgraded": 0,
             "namespaces_created": 0,
             "reviews": 0,
             "dry_run": dry_run,
         }
         try:
             with self.db.transaction() as conn:
+                seen_revision_ids: set[str] = set()
                 for record in records[1:]:
                     record_type = record.get("type")
                     if record_type == "namespace":
-                        name = str(record.get("name", "")).strip()
-                        if not name or name in {".", ".."} or any(c in name for c in ("/", "\\", "\x00")):
-                            counts["conflicts"] += 1
+                        raw_name = record.get("name")
+                        name = raw_name.strip() if isinstance(raw_name, str) else ""
+                        if not valid_namespace_name(name):
+                            counts["malformed"] += 1
                             continue
                         if namespace_kind(conn, name) is None:
                             conn.execute(
@@ -926,12 +1005,53 @@ class KnowledgeService:
                             counts["namespaces_created"] += 1
                         continue
                     if record_type != "entry":
+                        counts["malformed"] += 1
+                        continue
+                    raw_namespace = record.get("namespace")
+                    raw_entry_id = record.get("entry_id")
+                    namespace = raw_namespace.strip() if isinstance(raw_namespace, str) else ""
+                    entry_id = raw_entry_id.strip() if isinstance(raw_entry_id, str) else ""
+                    if not valid_namespace_name(namespace) or not entry_id:
+                        counts["malformed"] += 1
+                        continue
+                    entry_row = conn.execute(
+                        "SELECT * FROM entries WHERE entry_id = ?", (entry_id,)
+                    ).fetchone()
+                    if entry_row is not None and str(entry_row["namespace"]) != namespace:
                         counts["conflicts"] += 1
                         continue
-                    namespace = str(record.get("namespace", "")).strip()
-                    entry_id = str(record.get("entry_id", "")).strip()
-                    if not namespace or not entry_id:
-                        counts["conflicts"] += 1
+                    raw_revisions = record.get("revisions") or []
+                    if not isinstance(raw_revisions, list):
+                        counts["malformed"] += 1
+                        continue
+                    revisions: list[dict[str, Any]] = []
+                    for revision in raw_revisions:
+                        validated = validate_revision(revision)
+                        if validated is None:
+                            counts["malformed"] += 1
+                            continue
+                        revision_id = str(validated["revision_id"]).strip()
+                        if (
+                            conn.execute(
+                                "SELECT 1 FROM entry_revisions WHERE revision_id = ?",
+                                (revision_id,),
+                            ).fetchone()
+                            is not None
+                        ):
+                            # Already present in the database: keep the existing
+                            # behaviour and count it as skipped.
+                            counts["skipped"] += 1
+                            continue
+                        if revision_id in seen_revision_ids:
+                            # Seen earlier in this same import batch. The database
+                            # check above would not catch it, so the INSERT would
+                            # abort the transaction on the UNIQUE constraint.
+                            # Count it as malformed and keep importing.
+                            counts["malformed"] += 1
+                            continue
+                        seen_revision_ids.add(revision_id)
+                        revisions.append(validated)
+                    if entry_row is None and not revisions:
                         continue
                     if namespace_kind(conn, namespace) is None:
                         conn.execute(
@@ -940,12 +1060,6 @@ class KnowledgeService:
                             (namespace, "shared", iso(at)),
                         )
                         counts["namespaces_created"] += 1
-                    entry_row = conn.execute(
-                        "SELECT * FROM entries WHERE entry_id = ?", (entry_id,)
-                    ).fetchone()
-                    if entry_row is not None and str(entry_row["namespace"]) != namespace:
-                        counts["conflicts"] += 1
-                        continue
                     if entry_row is None:
                         conn.execute(
                             "INSERT INTO entries (entry_id, namespace, created_at, "
@@ -958,27 +1072,8 @@ class KnowledgeService:
                             ),
                         )
                         counts["created_entries"] += 1
-                    for revision in record.get("revisions", []) or []:
-                        if not isinstance(revision, dict):
-                            counts["conflicts"] += 1
-                            continue
-                        revision_id = str(revision.get("revision_id", "")).strip()
-                        if not revision_id:
-                            counts["conflicts"] += 1
-                            continue
-                        if (
-                            conn.execute(
-                                "SELECT 1 FROM entry_revisions WHERE revision_id = ?",
-                                (revision_id,),
-                            ).fetchone()
-                            is not None
-                        ):
-                            counts["skipped"] += 1
-                            continue
-                        for source_ref in revision.get("sources", []) or []:
-                            for key in ("storage_path", "path"):
-                                if key in source_ref and not self._safe_relative(str(source_ref[key])):
-                                    raise self._json_error("import contains a path traversal reference")
+                    for revision in revisions:
+                        revision_id = str(revision["revision_id"]).strip()
                         kind_value = str(revision.get("kind", "observation"))
                         try:
                             kind = Kind(kind_value)
@@ -986,13 +1081,7 @@ class KnowledgeService:
                             kind = Kind.OBSERVATION
                         tags = revision.get("tags") or []
                         scope = revision.get("scope") or {}
-                        if not isinstance(tags, list) or not isinstance(scope, dict):
-                            counts["conflicts"] += 1
-                            continue
                         claim_text = str(revision.get("claim", ""))
-                        if len(claim_text.encode("utf-8")) > self.config.limits.claim_body_bytes:
-                            counts["conflicts"] += 1
-                            continue
                         prev_candidate = revision.get("prev_revision_id")
                         prev_revision_id = None
                         if (
@@ -1004,6 +1093,12 @@ class KnowledgeService:
                             is not None
                         ):
                             prev_revision_id = str(prev_candidate)
+                        lifecycle = revision.get("lifecycle")
+                        evidence_class = revision.get("evidence_class")
+                        if lifecycle in {"published", "disputed"} or (
+                            evidence_class is not None and str(evidence_class) != "unverified"
+                        ):
+                            counts["downgraded"] += 1
                         conn.execute(
                             """
                             INSERT INTO entry_revisions
@@ -1095,8 +1190,12 @@ class KnowledgeService:
                                 (revision_id, entry_id),
                             )
                         for review in revision.get("reviews", []) or []:
+                            if not isinstance(review, dict):
+                                counts["malformed"] += 1
+                                continue
                             review_id = str(review.get("review_id", "")).strip()
                             if not review_id:
+                                counts["malformed"] += 1
                                 continue
                             if (
                                 conn.execute(
@@ -1136,6 +1235,15 @@ class KnowledgeService:
         counts["skips"] = counts["skipped"]
         return counts
 
+    @staticmethod
+    def _optional_int(value: Any, name: str) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(ErrorCode.INVALID_ARGUMENT, f"{name} must be an integer") from exc
+
     # -- admin: dispatch -------------------------------------------------
     def admin_dispatch(self, cmd: str, args: Mapping[str, Any] | None = None) -> Any:
         arguments = dict(args or {})
@@ -1155,6 +1263,7 @@ class KnowledgeService:
             "backup.create": "backup.create",
             "backup.verify": "backup.verify",
             "backup.restore": "backup.restore",
+            "backup.prune": "backup.prune",
             "memory.add": "memory.add",
             "memory.correct": "memory.correct",
             "memory.retract": "memory.retract",
@@ -1291,6 +1400,12 @@ class KnowledgeService:
             if not value or not destination:
                 raise self._json_error("path and destination are required")
             return self.backup_restore(str(value), str(destination))
+        if name == "backup.prune":
+            return self.backup_prune(
+                self._optional_int(arguments.get("keep_daily"), "keep_daily"),
+                self._optional_int(arguments.get("keep_weekly"), "keep_weekly"),
+                bool(arguments.get("dry_run", False)),
+            )
         if name == "export":
             output = arguments.get("path") or arguments.get("output")
             if not output:

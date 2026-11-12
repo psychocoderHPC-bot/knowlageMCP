@@ -13,9 +13,23 @@ SPDX-License-Identifier: ISC
 
 `get_protocol_info` returns the protocol version, application version, schema
 version, tool names, the skill resource URI, and feature flags, with no
-private state. Compatibility rule: the client major must equal the server
-major, and the client minor must not exceed the server minor. Unknown or
-malformed client versions are rejected, not guessed.
+private state.
+
+The gateway accepts a client whose protocol **major** equals the server major;
+minor releases within a major add fields without changing existing semantics.
+Unknown or malformed versions are rejected, not guessed.
+
+Clients may send `X-Knowlage-Protocol: <major.minor>` on any HTTP request. The
+gateway validates it on `POST /v1/bridge/register` and
+`POST /v1/tools/{tool}`:
+
+- absent header: accepted, for clients that predate negotiation;
+- same major: accepted;
+- different major, empty value, or malformed value: HTTP 400 with
+  `{"ok": false, "error": {"code": "INVALID_ARGUMENT", "message": "...",
+  "details": {"client_protocol": "...", "server_protocol": "..."}}}`.
+
+The stdio bridge sends its `PROTOCOL_VERSION` on every gateway request.
 
 ## MCP tools (the full set)
 
@@ -34,7 +48,7 @@ JSON text block.
 | `request_mentor` | `namespace`, `scopes[]` | `MentorRequest` (request ID, comparison code, `pending` state, expiry) |
 | `enrollment_status` | `request_id` | `MentorRequest` (current state, `approved_at` when approved). Only the caller's own request is inspectable. |
 | `get_context` | `task?`, `scope?` | a small session-start bundle: relevant entries with snippets, scope, evidence labels, and warnings, within the search byte budget |
-| `search` | `query`, `filters?` (namespace, kinds, lifecycle, evidence_class, tags, scope, include_candidates, author_agent_id), `max_results?`, `max_bytes?`, `cursor?` | `SearchResponse` (results with entry/revision IDs, snippets, scope, evidence label, score, time; total; truncated flag; opaque `next_cursor`; approx bytes) |
+| `search` | `query`, `filters?` (namespace, kinds, lifecycle, evidence_class, tags, scope, include_candidates, author_agent_id), `max_results?`, `max_bytes?`, `cursor?` | `SearchResponse` (results with entry/revision IDs, snippets, scope, evidence label, score, time, and `selection_reasons`; total; truncated flag; opaque `next_cursor`; `approx_bytes`; `estimated_tokens` with `token_estimate_method`) |
 | `get_entry` | `entry_id`, `revision_id?`, `page?`, `cursor?` | bounded `EntryDetail` page: full revision fields, sources, evidence references, attached reviews; history pages on request |
 | `record` | `namespace`, `entry` (see payload below), `idempotency_key?` | the stored entry (dedupe may return an existing entry ID) |
 | `propose_revision` | `entry_id`, `expected_revision`, `entry`, `idempotency_key?` | the new candidate revision; `REVISION_CONFLICT` when stale |
@@ -104,6 +118,21 @@ layer, where domain validation can still return `INVALID_ARGUMENT`.
 filtering. Their `total` value and `next_cursor` reflect that bounded candidate
 pool, not every database match. This is a bounded-work guard: narrow the query
 or add filters when you need coverage beyond the pool.
+
+### Search response annotations
+
+`SearchResponse` and `ContextBundle` carry `estimated_tokens` and
+`token_estimate_method`. The number is `ceil(serialized_utf8_bytes / 4)` of the
+JSON payload actually returned, after the byte budget has dropped whole
+results. It is an **estimate derived from bytes, not a tokenizer count**; the
+method string says so. `approx_bytes` remains the hard transport bound.
+
+Each `SearchResult` carries `selection_reasons`: at most five short, concrete
+strings explaining why that row was returned. A reason appears only when it is
+true for the row. The current vocabulary is `published`, `scope matches
+query`, `exact identifier match`, `fts match`, `evidence: <class>` (for
+example `evidence: reproduced`), `contradiction visible`, `candidate low
+trust`, and `duplicate lineage merged`.
 
 ## HTTP bridge API
 

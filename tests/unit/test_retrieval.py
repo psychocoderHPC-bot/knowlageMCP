@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,42 @@ def test_cursor_pagination(env: ServiceEnv) -> None:
         )
 
 
+def test_selection_reasons_and_token_estimate(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    env.service.memory_add(namespace="shared", kind="observation", text="reasonprobe published hint")
+    response = env.service.search(session, SearchRequest(query="reasonprobe hint"))
+    assert len(response.results) == 1
+    result = response.results[0]
+    assert "published" in result.selection_reasons
+    assert len(result.selection_reasons) <= 5
+    assert "estimate" in response.token_estimate_method
+    assert response.estimated_tokens > 0
+    payload = json.dumps(response.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    assert response.estimated_tokens == (len(payload) + 3) // 4
+
+
+def test_selection_reasons_include_scope_and_low_trust(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    _record(
+        env,
+        session,
+        "scopereason probe",
+        title="scoped",
+        scope=Scope(repository="alpaka"),
+    )
+    response = env.service.search(
+        session,
+        SearchRequest(query="scopereason", filters=SearchFilters(scope=Scope(repository="alpaka"))),
+    )
+    assert len(response.results) == 1
+    reasons = response.results[0].selection_reasons
+    assert "scope matches query" in reasons
+    assert "candidate low trust" in reasons
+    assert len(reasons) <= 5
+
+
 def test_get_context_returns_published_bundle(env: ServiceEnv) -> None:
     session = env.session(env.register())
     published = env.service.memory_add(
@@ -166,6 +203,12 @@ def test_get_context_returns_published_bundle(env: ServiceEnv) -> None:
     assert "shared" in bundle.namespaces
     assert [result.entry_id for result in bundle.results] == [published.entry.entry_id]
     assert bundle.approx_bytes > 0
+    assert bundle.estimated_tokens > 0
+    assert "estimate" in bundle.token_estimate_method
+    payload = json.dumps(bundle.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    assert bundle.estimated_tokens == (len(payload) + 3) // 4
 
 
 def test_get_entry_history_and_paging(tmp_path: Path) -> None:
