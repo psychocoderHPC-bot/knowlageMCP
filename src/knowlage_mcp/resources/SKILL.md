@@ -1,3 +1,7 @@
+---
+name: knowlageMCP
+description: Use the host-owned knowlageMCP gateway for durable, verified task knowledge. Covers registering an actor, retrieving scoped context, searching, recording and revising entries, reporting outcomes, evidence upload, and mentor review. Trigger on knowlageMCP, knowledge gateway, register_agent, get_context, get_usage_skill, record, propose_revision, review_next, submit_review.
+---
 <!--
 SPDX-FileCopyrightText: 2026 René Widera
 SPDX-License-Identifier: ISC
