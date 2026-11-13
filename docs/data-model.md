@@ -5,10 +5,11 @@ SPDX-License-Identifier: ISC
 
 # Data model
 
-Schema version 1. Snake-case tables, TEXT primary keys, ISO-8601 UTC
-timestamps. The FTS table is maintained by the knowledge layer, not by
-triggers. A new schema change is a new ordered migration; applied migrations
-are never edited.
+Schema version 2, tracked by `MAX_VERSION` in
+`src/knowlage_mcp/migrations.py`. Snake-case tables, TEXT primary keys,
+ISO-8601 UTC timestamps. The FTS table is maintained by the knowledge layer,
+not by triggers. A new schema change is a new ordered migration; applied
+migrations are never edited.
 
 ## Tables
 

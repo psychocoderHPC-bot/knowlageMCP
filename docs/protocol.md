@@ -9,7 +9,8 @@ SPDX-License-Identifier: ISC
 
 - Application version: `0.1.0` (this repository may be an unreleased 0.1.0).
 - Bridge/MCP wire protocol version: `1.0`.
-- Schema version: `1` (database migration level).
+- Schema version: `2` (database migration level; `MAX_VERSION` in
+  `src/knowlage_mcp/migrations.py` is authoritative).
 
 `get_protocol_info` returns the protocol version, application version, schema
 version, tool names, the skill resource URI, and feature flags, with no
