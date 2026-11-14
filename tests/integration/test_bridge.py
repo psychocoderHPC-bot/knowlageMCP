@@ -89,6 +89,32 @@ async def test_bridge_round_trip_and_actor_rule(gateway_server: RunningGateway) 
             item["entry_id"] for item in found["data"]["results"]
         ]
 
+        uploaded = _envelope(
+            await session.call_tool(
+                "upload_evidence",
+                {"text": "review log: 14 tests passed", "actor_handle": handle_one},
+            )
+        )
+        assert uploaded["ok"] is True, uploaded
+        evidence_id = uploaded["data"]["evidence_id"]
+        preview = _envelope(
+            await session.call_tool(
+                "get_evidence_text", {"evidence_id": evidence_id, "actor_handle": handle_one}
+            )
+        )
+        assert preview["ok"] is True, preview
+        assert preview["data"]["text"] == "review log: 14 tests passed"
+        assert preview["data"]["truncated"] is False
+        assert preview["data"]["preview_bytes"] == len("review log: 14 tests passed")
+
+        unauth_preview = _envelope(
+            await session.call_tool(
+                "get_evidence_text", {"evidence_id": evidence_id, "actor_handle": "act_foreign"}
+            )
+        )
+        assert unauth_preview["ok"] is False
+        assert unauth_preview["error"]["code"] == "AUTH_REQUIRED"
+
         foreign = _envelope(
             await session.call_tool("search", {"query": "probe", "actor_handle": "act_foreign"})
         )

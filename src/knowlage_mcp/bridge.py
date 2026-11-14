@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -43,6 +45,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "host.containers.internal"
 DEFAULT_PORT = 2230
 DEFAULT_MENTOR_SCOPES: tuple[str, ...] = ("review", "publish")
+EVIDENCE_TEXT_LIMIT = 12_000
+NON_TEXT_EVIDENCE_TYPES = {
+    "application/pdf",
+    "application/zip",
+    "application/gzip",
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
 
 
 @dataclass
@@ -262,6 +274,8 @@ class BridgeBackend:
             return self._handle_response(status, response, actor)
         if name == "upload_evidence":
             return await self._upload(arguments, actor)
+        if name == "get_evidence_text":
+            return await self._get_evidence_text(str(arguments.get("evidence_id", "")), actor)
 
         body = {k: v for k, v in arguments.items() if k != "actor_handle"}
         status, response = await self._request(
@@ -300,6 +314,51 @@ class BridgeBackend:
         if status == 401:
             return self._handle_response(status, response, actor)
         return self._envelope(status, response)
+
+    async def _get_evidence_text(self, evidence_id: str, actor: Actor) -> dict[str, Any]:
+        """Read a bounded UTF-8 preview through the gateway's existing evidence ACL."""
+        if not evidence_id.startswith("ev_"):
+            return failure(ErrorCode.INVALID_ARGUMENT, "evidence_id is required")
+        headers = self._headers(actor)
+        headers[HEADER_PROTOCOL] = PROTOCOL_VERSION
+        try:
+            async with self._client.stream(
+                "GET", f"/v1/bridge/evidence/{quote(evidence_id, safe='')}", headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    try:
+                        error = json.loads(body)
+                    except ValueError:
+                        error = None
+                    return self._handle_response(response.status_code, error, actor)
+                media_type = response.headers.get("content-type", "application/octet-stream")
+                if media_type.split(";", 1)[0].strip().lower() in NON_TEXT_EVIDENCE_TYPES:
+                    return failure(ErrorCode.INVALID_ARGUMENT, "evidence is not UTF-8 text")
+                chunks = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=4096):
+                    chunks.extend(chunk[: EVIDENCE_TEXT_LIMIT + 1 - len(chunks)])
+                    if len(chunks) > EVIDENCE_TEXT_LIMIT:
+                        break
+                truncated = len(chunks) > EVIDENCE_TEXT_LIMIT
+                try:
+                    decoder = codecs.getincrementaldecoder("utf-8")()
+                    preview = decoder.decode(bytes(chunks[:EVIDENCE_TEXT_LIMIT]), final=not truncated)
+                except UnicodeDecodeError:
+                    return failure(ErrorCode.INVALID_ARGUMENT, "evidence is not UTF-8 text")
+                if any(ord(char) < 32 and char not in "\t\n\r" for char in preview):
+                    return failure(ErrorCode.INVALID_ARGUMENT, "evidence is not UTF-8 text")
+                return success(
+                    {
+                        "evidence_id": evidence_id,
+                        "text": preview,
+                        "media_type": media_type,
+                        "truncated": truncated,
+                        "preview_bytes": len(preview.encode("utf-8")),
+                    }
+                )
+        except httpx2.TransportError:
+            return failure(ErrorCode.BACKEND_UNAVAILABLE, f"gateway is unreachable at {self.base_url}")
 
     async def session_close(
         self, *, actor_handle: str | None = None, close_all: bool = False
@@ -581,6 +640,10 @@ def build_bridge_server(backend: BridgeBackend) -> MCPServer[Any]:
             {"text": text, "media_type": media_type, "name": name},
             actor_handle,
         )
+
+    @mcp.tool(name="get_evidence_text", description=TOOL_DESCRIPTIONS["get_evidence_text"])
+    async def get_evidence_text(evidence_id: str, actor_handle: str | None = None) -> str:
+        return await invoke("get_evidence_text", {"evidence_id": evidence_id}, actor_handle)
 
     return mcp
 

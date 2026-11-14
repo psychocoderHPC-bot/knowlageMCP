@@ -34,12 +34,13 @@ The stdio bridge sends its `PROTOCOL_VERSION` on every gateway request.
 
 ## MCP tools (the full set)
 
-16 tool names are served over the MCP transports: the 15 canonical names in
+16 tool names are served by both MCP transports: the 15 canonical names in
 `TOOL_NAMES` (`get_protocol_info` through `session_close`) plus the bounded
-`upload_evidence` helper. `get_protocol_info` reports the canonical 15 names in
-its `tool_names` field. Every authenticated tool takes an optional
-`actor_handle` argument (see multiplexing below). Tool results are a single
-JSON text block.
+`upload_evidence` helper. The stdio bridge also provides `get_evidence_text`
+using the gateway's authenticated evidence-download route. `get_protocol_info`
+reports the canonical 15 names in its `tool_names` field. Every
+authenticated tool takes an optional `actor_handle` argument (see
+multiplexing below). Tool results are a single JSON text block.
 
 | Tool | Arguments | Response |
 |---|---|---|
@@ -58,6 +59,7 @@ JSON text block.
 | `submit_review` | `entry_id`, `revision_id`, `result` (`supports`\|`contradicts`\|`inconclusive`\|`duplicate`\|`out_of_scope`), `method`, `job_id?`, `lease_id?`, `evidence?`, `conditions?`, `limitations?`, `evidence_class?`, `idempotency_key?` | `SubmitReviewResult`: `review_id`, `entry_id`, `revision_id`, `lifecycle` (the revision lifecycle after the decision), `evidence_class`, `published` (true when the decision moved the entry to `published`), `job_state` (default `done`), `entry_current_revision_id` (the entry's current revision after the write) |
 | `session_close` | none | `{closed: true}`; releases leases and revokes the session |
 | `upload_evidence` | `text`, `media_type?` (default `text/plain`), `name?`, `actor_handle?` | `{evidence_id, sha256, size_bytes, media_type, redacted, name, agent_id}`. Bounded text-only helper: the payload is UTF-8 text, never a filesystem path; the object is capped at `limits.evidence_object_bytes` (256 KiB default) and counted against the evidence quota. Exceeding the per-object cap returns `BUDGET_EXCEEDED` with the size in `details`. |
+| `get_evidence_text` (stdio bridge only) | `evidence_id`, `actor_handle?` | At most 12,000 bytes of UTF-8 text, `media_type`, `preview_bytes`, and `truncated`. Uses the same authorization check as `GET /v1/bridge/evidence/{evidence_id}`; rejects binary objects. |
 
 Also:
 
