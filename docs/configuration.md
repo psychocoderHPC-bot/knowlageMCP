@@ -100,7 +100,7 @@ they use an injectable clock so tests can advance time without sleeping.
 | Key | Default | Effect |
 |---|---|---|
 | `lease_seconds` | `600` | A review job lease expires after this many seconds; the item becomes available again. |
-| `max_attempts` | `3` | A job with this many failed attempts is parked, preventing retry loops on broken items. |
+| `max_attempts` | `3` | A job with this many failed or inconclusive attempts is parked, preventing retry loops on broken items. |
 | `mentor_items_per_session` | `20` | Review items one mentor session may handle; beyond it `review_next` reports the queue empty for that session (`BUDGET_EXCEEDED`). |
 
 ## [retrieval]

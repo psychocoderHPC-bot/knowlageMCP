@@ -33,8 +33,10 @@ exclusively through the MCP tools.
 - Then call `review_next` again. Never hold several leases or work on items
   you do not have leased.
 - If the environment needed for reproduction is unavailable, submit
-  `inconclusive` (with the reason) or let the lease lapse. There is no penalty
-  for deferring.
+  `inconclusive` (with the reason) or let the lease lapse. An `inconclusive`
+  submission returns the item to the queue and consumes one of its
+  `review.max_attempts` attempts; other eligible reviewers are offered it
+  first, and you get it again only when it is the only eligible item.
 - Read the exact revision with `get_entry` and preview any attached text
   evidence with `get_evidence_text` before deciding. `truncated: true` means
   part of the object was not shown. An author's log establishes what was
@@ -57,7 +59,8 @@ A submission needs, for the exact leased revision:
 `supports` and `contradicts` are strong moves: they can publish the revision or
 surface a dispute. Use them only when your method actually produced the result.
 When in doubt, `inconclusive` keeps the entry a candidate and stores your
-reason; that is the honest default.
+reason; that is the honest default. It also requeues the item and spends one
+attempt, so use it when you genuinely cannot judge.
 
 ## 4. No self-approval
 
