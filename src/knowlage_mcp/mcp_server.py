@@ -75,6 +75,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "session_close": "Release leases and revoke the current session.",
     "get_usage_skill": "Return the bounded packaged agent usage skill.",
     "upload_evidence": "Store a bounded text evidence object; no filesystem paths.",
+    "get_evidence_text": "Read a bounded UTF-8 preview of an authorized evidence object (stdio bridge only).",
 }
 
 

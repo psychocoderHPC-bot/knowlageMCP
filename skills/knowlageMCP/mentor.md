@@ -35,6 +35,10 @@ exclusively through the MCP tools.
 - If the environment needed for reproduction is unavailable, submit
   `inconclusive` (with the reason) or let the lease lapse. There is no penalty
   for deferring.
+- Read the exact revision with `get_entry` and preview any attached text
+  evidence with `get_evidence_text` before deciding. `truncated: true` means
+  part of the object was not shown. An author's log establishes what was
+  reported, not an independent reproduction.
 - Your per-session budget is 20 items by default. When `review_next` reports
   the queue empty for your session, stop and report.
 
