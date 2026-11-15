@@ -129,6 +129,14 @@ class ReviewManager:
         ).fetchone()
         return int(row["n"]) if row is not None else 0
 
+    def _already_inconclusive(self, conn: sqlite3.Connection, agent_id: str, revision_id: str) -> bool:
+        """Whether this agent already returned ``inconclusive`` for the revision."""
+        row = conn.execute(
+            "SELECT 1 FROM reviews WHERE reviewer_agent_id = ? AND revision_id = ? AND result = ? LIMIT 1",
+            (agent_id, revision_id, ReviewResult.INCONCLUSIVE.value),
+        ).fetchone()
+        return row is not None
+
     def _priority(
         self, conn: sqlite3.Connection, revision_id: str, evidence_class: str, age_hours: float
     ) -> float:
@@ -226,7 +234,7 @@ class ReviewManager:
                 """,
                 (self.config.review.max_attempts, iso(at)),
             ).fetchall()
-            scored: list[tuple[float, sqlite3.Row]] = []
+            scored: list[tuple[int, float, sqlite3.Row]] = []
             for candidate in rows:
                 job = self._select_job(conn, str(candidate["job_id"]))
                 if job is None:
@@ -254,17 +262,24 @@ class ReviewManager:
                 priority = self._priority(
                     conn, str(job["revision_id"]), str(job["evidence_class"]), age_hours
                 )
-                scored.append((priority, job))
+                # Soft preference: a revision this reviewer already called
+                # inconclusive sorts behind every other eligible job, but is
+                # still leased when it is the only candidate. A hard exclusion
+                # would deadlock a single-reviewer deployment before the
+                # attempt budget can run out.
+                deferred = self._already_inconclusive(conn, session.agent_id, str(job["revision_id"]))
+                scored.append((0 if deferred else 1, priority, job))
             if not scored:
                 return None
             scored.sort(
                 key=lambda item: (
                     item[0],
-                    item[1]["created_at"],
+                    item[1],
+                    item[2]["created_at"],
                 ),
                 reverse=True,
             )
-            priority, chosen = scored[0]
+            _, priority, chosen = scored[0]
             job_id = str(chosen["job_id"])
             lease_expires = at + timedelta(seconds=lease_seconds)
             lease_id = stable_id("lse", job_id, session.session_id, iso(at))
@@ -431,7 +446,21 @@ class ReviewManager:
                     iso(at),
                 ),
             )
-            if not mentor:
+            if request.result == ReviewResult.INCONCLUSIVE:
+                # An inconclusive review is not a decision: return the item to
+                # the queue and consume one attempt, mirroring _fail_attempt's
+                # exhaustion rule so a revision is never left in candidate
+                # state without a visible job. review_next deprioritizes the
+                # revision for this reviewer, but does not exclude it.
+                attempts = int(refreshed["attempts"]) + 1
+                job_state = "exhausted" if attempts >= self.config.review.max_attempts else "queued"
+                tx.execute(
+                    "UPDATE review_jobs SET attempts = ?, state = ?, lease_owner = NULL, "
+                    "lease_id = NULL, lease_expires_at = NULL WHERE job_id = ?",
+                    (attempts, job_state, job_id),
+                )
+                evidence_class = request.evidence_class or EvidenceClass(str(job["evidence_class"]))
+            elif not mentor:
                 # Peer contributions add evidence only; the lifecycle is untouched
                 # and the item returns to the queue for an authorized mentor.
                 tx.execute(
@@ -513,7 +542,7 @@ class ReviewManager:
                 lifecycle = Lifecycle.DISPUTED
                 evidence_class = request.evidence_class or EvidenceClass(str(job["evidence_class"]))
             else:
-                # inconclusive, duplicate, out_of_scope: no publication.
+                # duplicate, out_of_scope: terminal, no publication.
                 tx.execute(
                     "UPDATE review_jobs SET state = 'done', lease_owner = NULL, lease_id = NULL, "
                     "lease_expires_at = NULL WHERE job_id = ?",

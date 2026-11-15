@@ -61,7 +61,10 @@ is a fresh decision, not an extension.
 - The per-session budget is `review.mentor_items_per_session` (default 20).
   After that, `review_next` reports the queue empty for that session.
 - If reproduction or the needed environment is unavailable, submit
-  `inconclusive` or let the lease lapse. There is no penalty for deferring.
+  `inconclusive` or let the lease lapse. An `inconclusive` submission returns
+  the item to the queue and consumes one of its `review.max_attempts`
+  attempts. The item is offered to other eligible reviewers first; the same
+  reviewer gets it again only when it is the only eligible item.
 
 ## Evidence requirements
 
@@ -76,7 +79,7 @@ A `submit_review` needs, for the exact leased revision:
 
 `supports` or `contradicts` on an eligible revision is what can move the
 lifecycle (publication or dispute). `inconclusive` keeps the entry a candidate
-and stores the reason.
+and stores the reason, then requeues the item.
 
 ## No self-approval
 
