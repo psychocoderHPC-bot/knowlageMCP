@@ -122,6 +122,25 @@ def _row_tags(value: str | None) -> tuple[str, ...]:
     return tuple(_json_list(value))
 
 
+#: Evidence classes from weakest to strongest. The order drives downgrade checks.
+_EVIDENCE_CLASS_ORDER: tuple[EvidenceClass, ...] = (
+    EvidenceClass.UNVERIFIED,
+    EvidenceClass.SOURCE_CHECKED,
+    EvidenceClass.REPRODUCED,
+    EvidenceClass.OPERATOR_CONFIRMED,
+)
+
+
+def _evidence_class_downgrade_warning(declared: EvidenceClass, stored: EvidenceClass) -> str | None:
+    """Name a clamp in the response instead of discarding the value silently."""
+    if _EVIDENCE_CLASS_ORDER.index(declared) <= _EVIDENCE_CLASS_ORDER.index(stored):
+        return None
+    return (
+        f"evidence_class downgraded from '{declared.value}' to '{stored.value}': "
+        "agent writes stay unverified until an independent review sets the class"
+    )
+
+
 def _warnings_for(
     conn: sqlite3.Connection, revision_id: str, lifecycle: Lifecycle
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -709,6 +728,9 @@ class KnowledgeManager:
                 at=at,
             )
             detail = build_entry_detail(conn, entry_id, revision_id)
+            downgrade = _evidence_class_downgrade_warning(request.entry.evidence_class, evidence_class)
+            if downgrade is not None:
+                detail = detail.model_copy(update={"warnings": (*detail.warnings, downgrade)})
             result = WriteResult(entry=detail, duplicate=False, created=True)
             self._idempotent_put(conn, request.idempotency_key, scope_key, result, at)
             return result
@@ -788,6 +810,11 @@ class KnowledgeManager:
                 at=at,
             )
             detail = build_entry_detail(conn, request.entry_id, revision_id)
+            downgrade = _evidence_class_downgrade_warning(
+                request.entry.evidence_class, EvidenceClass.UNVERIFIED
+            )
+            if downgrade is not None:
+                detail = detail.model_copy(update={"warnings": (*detail.warnings, downgrade)})
             result = WriteResult(entry=detail, duplicate=False, created=True)
             self._idempotent_put(conn, request.idempotency_key, scope_key, result, at)
             return result

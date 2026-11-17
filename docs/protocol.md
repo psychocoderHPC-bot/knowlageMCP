@@ -77,6 +77,16 @@ The `entry` payload for `record` and `propose_revision` is `EntryPayload`:
 `reproduced`, `operator_confirmed`), `sensitivity`, `sources[]`, `evidence[]`,
 `contributors[]`. Unknown keys are rejected.
 
+An agent write cannot self-declare verification. `record` stores the
+`candidate` lifecycle and `unverified` evidence class unless the caller holds
+the operator role, and `propose_revision` always stores a candidate revision
+with `unverified`. That rule keeps a self-declared class from raising retrieval
+rank or review priority. When a call requests a stronger `evidence_class` than
+the store will accept, the write proceeds and the response carries an explicit
+`warnings` entry naming the requested and the stored class, so the clamp is
+visible to the caller. Attached `evidence` references are stored with the
+revision either way.
+
 ## Error envelope and codes
 
 Failed operations return, over HTTP:
