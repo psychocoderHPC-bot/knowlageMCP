@@ -220,6 +220,107 @@ def test_lease_renewal_expiry_and_attempts(env: ServiceEnv) -> None:
     assert env.service.review_next(mentor) is None
 
 
+def test_inconclusive_requeues_and_defers_same_reviewer(env: ServiceEnv) -> None:
+    _, entry_a, revision_a = _author_entry(env, claim="inconclusive probe a")
+    mentor_a, _ = make_mentor(env)
+    job_a = env.service.review_next(mentor_a)
+    assert job_a is not None
+    assert job_a.revision_id == revision_a
+
+    result = _submit(
+        env,
+        mentor_a,
+        entry_a,
+        revision_a,
+        job_a.job_id,
+        job_a.lease_id,
+        result=ReviewResult.INCONCLUSIVE,
+    )
+    assert result.published is False
+    assert result.lifecycle is Lifecycle.CANDIDATE
+    assert result.job_state == "queued"
+    row = (
+        env.db.connect()
+        .execute("SELECT attempts, state FROM review_jobs WHERE job_id = ?", (job_a.job_id,))
+        .fetchone()
+    )
+    assert row["attempts"] == 1
+    assert row["state"] == "queued"
+
+    # Give revision A an age/priority advantage so only the soft preference
+    # can keep it behind the newer job for the same reviewer.
+    env.clock.advance(3600)
+    _, entry_b, revision_b = _author_entry(env, claim="inconclusive probe b")
+
+    next_job = env.service.review_next(mentor_a)
+    assert next_job is not None
+    assert next_job.revision_id == revision_b
+
+    other_mentor, _ = make_mentor(env)
+    other_job = env.service.review_next(other_mentor)
+    assert other_job is not None
+    assert other_job.revision_id == revision_a
+
+    _submit(env, mentor_a, entry_b, revision_b, next_job.job_id, next_job.lease_id)
+    requeued = _submit(
+        env,
+        other_mentor,
+        entry_a,
+        revision_a,
+        other_job.job_id,
+        other_job.lease_id,
+        result=ReviewResult.INCONCLUSIVE,
+    )
+    assert requeued.job_state == "queued"
+    attempts = (
+        env.db.connect()
+        .execute("SELECT attempts FROM review_jobs WHERE job_id = ?", (job_a.job_id,))
+        .fetchone()[0]
+    )
+    assert attempts == 2
+
+    only_job = env.service.review_next(mentor_a)
+    assert only_job is not None
+    assert only_job.revision_id == revision_a
+
+
+def test_inconclusive_attempts_exhaust_like_failed_attempts(env: ServiceEnv) -> None:
+    _, entry_id, revision_id = _author_entry(env, claim="inconclusive exhaustion probe")
+    mentor, _ = make_mentor(env)
+    job = env.service.review_next(mentor)
+    assert job is not None
+
+    for expected in range(1, env.config.review.max_attempts + 1):
+        if expected > 1:
+            # Distinct timestamps keep stable review IDs distinct.
+            env.clock.advance(1)
+        result = _submit(
+            env,
+            mentor,
+            entry_id,
+            revision_id,
+            job.job_id,
+            job.lease_id,
+            result=ReviewResult.INCONCLUSIVE,
+        )
+        row = (
+            env.db.connect()
+            .execute("SELECT attempts, state FROM review_jobs WHERE job_id = ?", (job.job_id,))
+            .fetchone()
+        )
+        assert row["attempts"] == expected
+        assert result.job_state == row["state"]
+        if expected < env.config.review.max_attempts:
+            assert row["state"] == "queued"
+            job = env.service.review_next(mentor)
+            assert job is not None
+            assert job.revision_id == revision_id
+
+    assert row["state"] == "exhausted"
+    assert env.service.review_next(mentor) is None
+    assert [item["state"] for item in env.service.list_review_jobs()] == ["exhausted"]
+
+
 def test_expired_mentor_grant_cannot_review(env: ServiceEnv) -> None:
     author, entry_id, revision_id = _author_entry(env, claim="expiry probe claim")
     registration = env.register(source="expiring-mentor")
