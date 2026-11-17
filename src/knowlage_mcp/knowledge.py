@@ -131,14 +131,77 @@ _EVIDENCE_CLASS_ORDER: tuple[EvidenceClass, ...] = (
 )
 
 
+def _downgrade_warning(field: str, requested: str, stored: str, reason: str) -> str:
+    """Format one clamp so every downgraded field names the same three things."""
+    return f"{field} downgraded from '{requested}' to '{stored}': {reason}"
+
+
 def _evidence_class_downgrade_warning(declared: EvidenceClass, stored: EvidenceClass) -> str | None:
     """Name a clamp in the response instead of discarding the value silently."""
     if _EVIDENCE_CLASS_ORDER.index(declared) <= _EVIDENCE_CLASS_ORDER.index(stored):
         return None
-    return (
-        f"evidence_class downgraded from '{declared.value}' to '{stored.value}': "
-        "agent writes stay unverified until an independent review sets the class"
+    return _downgrade_warning(
+        "evidence_class",
+        declared.value,
+        stored.value,
+        "agent writes stay unverified until an independent review sets the class",
     )
+
+
+def _lifecycle_downgrade_warning(declared: Lifecycle | None, stored: Lifecycle) -> str | None:
+    """Report a requested lifecycle the store did not keep."""
+    if declared is None or declared == stored:
+        return None
+    return _downgrade_warning(
+        "lifecycle",
+        declared.value,
+        stored.value,
+        "an agent write stays a candidate until an independent reviewer promotes it",
+    )
+
+
+def _last_verified_downgrade_warning(declared: datetime | None, stored: datetime | None) -> str | None:
+    """Report a verification time that was dropped from the stored revision."""
+    if declared is None or stored is not None:
+        return None
+    return _downgrade_warning(
+        "last_verified_at",
+        iso(declared),
+        "null",
+        "an agent write cannot declare its own verification time",
+    )
+
+
+def _clamp_warnings(
+    payload: EntryPayload,
+    *,
+    lifecycle: Lifecycle,
+    evidence_class: EvidenceClass,
+    last_verified_at: datetime | None,
+) -> tuple[str, ...]:
+    """Collect every value the store changed for one write, in field order."""
+    collected = (
+        _evidence_class_downgrade_warning(payload.evidence_class, evidence_class),
+        _lifecycle_downgrade_warning(payload.lifecycle, lifecycle),
+        _last_verified_downgrade_warning(payload.last_verified_at, last_verified_at),
+    )
+    return tuple(warning for warning in collected if warning is not None)
+
+
+def _pending_revision_warning(revision_id: str, current_revision_id: str) -> str:
+    """State that a correction is not served yet and which revision still is."""
+    return (
+        f"revision '{revision_id}' is pending and is not current: it will not be served until "
+        f"an independent reviewer promotes it, so current_revision_id stays '{current_revision_id}'"
+    )
+
+
+def _with_warnings(detail: EntryDetail, warnings: Iterable[str]) -> EntryDetail:
+    """Append warnings to a detail view without touching any stored fact."""
+    extra = tuple(warnings)
+    if not extra:
+        return detail
+    return detail.model_copy(update={"warnings": (*detail.warnings, *extra)})
 
 
 def _warnings_for(
@@ -193,7 +256,7 @@ def _sources_for(conn: sqlite3.Connection, revision_id: str) -> tuple[SourceRef,
 
 def _evidence_for(conn: sqlite3.Connection, revision_id: str) -> tuple[EvidenceRef, ...]:
     rows = conn.execute(
-        "SELECT evidence_id, sha256, size_bytes, media_type, redacted FROM evidence_objects "
+        "SELECT evidence_id, sha256, size_bytes, media_type, name, redacted FROM evidence_objects "
         "WHERE revision_id = ? ORDER BY created_at",
         (revision_id,),
     ).fetchall()
@@ -203,6 +266,7 @@ def _evidence_for(conn: sqlite3.Connection, revision_id: str) -> tuple[EvidenceR
             sha256=str(row["sha256"]),
             size_bytes=int(row["size_bytes"]),
             media_type=str(row["media_type"]),
+            name=row["name"],
             redacted=bool(row["redacted"]),
         )
         for row in rows
@@ -590,9 +654,9 @@ class KnowledgeManager:
                 conn.execute(
                     """
                     INSERT INTO evidence_objects
-                        (evidence_id, sha256, size_bytes, media_type, storage_path, redacted,
+                        (evidence_id, sha256, size_bytes, media_type, storage_path, name, redacted,
                          created_at, revision_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         ref.evidence_id,
@@ -600,6 +664,7 @@ class KnowledgeManager:
                         size_bytes,
                         ref.media_type or "application/octet-stream",
                         storage_path,
+                        ref.name,
                         int(ref.redacted),
                         iso(at),
                         revision_id,
@@ -613,11 +678,13 @@ class KnowledgeManager:
                         "evidence object is already attached to another revision",
                         details={"evidence_id": ref.evidence_id},
                     )
-                if attached is None:
-                    conn.execute(
-                        "UPDATE evidence_objects SET revision_id = ? WHERE evidence_id = ?",
-                        (revision_id, ref.evidence_id),
-                    )
+                # A name supplied with the attachment is kept; an omitted name
+                # never erases a name an earlier write recorded.
+                conn.execute(
+                    "UPDATE evidence_objects SET revision_id = ?, name = COALESCE(?, name) "
+                    "WHERE evidence_id = ?",
+                    (revision_id, ref.name, ref.evidence_id),
+                )
 
     @staticmethod
     def _insert_fts(conn: sqlite3.Connection, entry_id: str, revision_id: str, payload: EntryPayload) -> None:
@@ -728,9 +795,15 @@ class KnowledgeManager:
                 at=at,
             )
             detail = build_entry_detail(conn, entry_id, revision_id)
-            downgrade = _evidence_class_downgrade_warning(request.entry.evidence_class, evidence_class)
-            if downgrade is not None:
-                detail = detail.model_copy(update={"warnings": (*detail.warnings, downgrade)})
+            detail = _with_warnings(
+                detail,
+                _clamp_warnings(
+                    request.entry,
+                    lifecycle=lifecycle,
+                    evidence_class=evidence_class,
+                    last_verified_at=last_verified,
+                ),
+            )
             result = WriteResult(entry=detail, duplicate=False, created=True)
             self._idempotent_put(conn, request.idempotency_key, scope_key, result, at)
             return result
@@ -810,12 +883,24 @@ class KnowledgeManager:
                 at=at,
             )
             detail = build_entry_detail(conn, request.entry_id, revision_id)
-            downgrade = _evidence_class_downgrade_warning(
-                request.entry.evidence_class, EvidenceClass.UNVERIFIED
+            detail = _with_warnings(
+                detail,
+                (
+                    *_clamp_warnings(
+                        request.entry,
+                        lifecycle=Lifecycle.CANDIDATE,
+                        evidence_class=EvidenceClass.UNVERIFIED,
+                        last_verified_at=None,
+                    ),
+                    _pending_revision_warning(revision_id, str(current_revision_id)),
+                ),
             )
-            if downgrade is not None:
-                detail = detail.model_copy(update={"warnings": (*detail.warnings, downgrade)})
-            result = WriteResult(entry=detail, duplicate=False, created=True)
+            result = WriteResult(
+                entry=detail,
+                duplicate=False,
+                created=True,
+                pending_revision_id=revision_id,
+            )
             self._idempotent_put(conn, request.idempotency_key, scope_key, result, at)
             return result
 

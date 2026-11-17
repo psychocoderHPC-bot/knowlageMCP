@@ -473,6 +473,9 @@ class WriteResult(_ResponseModel):
     duplicate: bool = False
     idempotent: bool = False
     created: bool = True
+    #: Revision a ``propose_revision`` call created. It is pending review, so it
+    #: is not served: ``entry.current_revision_id`` still names the previous one.
+    pending_revision_id: str | None = None
 
 
 class ContextBundle(_ResponseModel):

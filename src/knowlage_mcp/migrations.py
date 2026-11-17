@@ -282,6 +282,13 @@ CREATE INDEX idx_entry_index_state_revision ON entry_index_state(revision_id);
 CREATE INDEX idx_extraction_proposals_entry_state ON extraction_proposals(entry_id, state);
 """,
     ),
+    (
+        3,
+        "persist the caller-supplied name of an attached evidence object",
+        """
+ALTER TABLE evidence_objects ADD COLUMN name TEXT;
+""",
+    ),
 ]
 
 MAX_VERSION: int = max(version for version, _, _ in MIGRATIONS)

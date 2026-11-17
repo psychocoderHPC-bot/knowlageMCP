@@ -181,7 +181,7 @@ def test_utc_helpers_roundtrip() -> None:
     assert iso(now).endswith("Z")
 
 
-def test_upgrade_v1_database_to_v2(tmp_path: Path) -> None:
+def test_upgrade_v1_database_to_current_version(tmp_path: Path) -> None:
     path = tmp_path / "v1.sqlite3"
     database = Database(path)
     conn = database.connect()
@@ -191,12 +191,55 @@ def test_upgrade_v1_database_to_v2(tmp_path: Path) -> None:
         (1, iso(utcnow())),
     )
     assert database.schema_version() == 1
-    assert database.migrate() == 2
-    assert database.schema_version() == 2
+    assert database.migrate() == MAX_VERSION
+    assert database.schema_version() == MAX_VERSION
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"index_generations", "entry_index_state", "extraction_proposals"} <= tables
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     database.close()
+
+
+def _evidence_name_column(conn: sqlite3.Connection) -> set[str]:
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(evidence_objects)")}
+
+
+def test_migration_3_adds_evidence_name_to_an_existing_database(tmp_path: Path) -> None:
+    """A database created before the change upgrades in place without data loss."""
+    path = tmp_path / "v2.sqlite3"
+    legacy = Database(path)
+    conn = legacy.connect()
+    legacy_scripts = [(version, script) for version, _, script in MIGRATIONS if version < 3]
+    for version, script in legacy_scripts:
+        conn.executescript(script)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (version, iso(utcnow())),
+        )
+    assert "name" not in _evidence_name_column(conn)
+    conn.execute(
+        "INSERT INTO evidence_objects "
+        "(evidence_id, sha256, size_bytes, media_type, storage_path, redacted, created_at, revision_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+        ("ev_legacy", "legacy", 12, "text/plain", "le/ga/legacy", 0, iso(utcnow())),
+    )
+    assert legacy.schema_version() == legacy_scripts[-1][0]
+    legacy.close()
+
+    upgraded = Database(path)
+    assert upgraded.migrate() == MAX_VERSION
+    conn = upgraded.connect()
+    assert "name" in _evidence_name_column(conn)
+    row = conn.execute("SELECT evidence_id, name FROM evidence_objects").fetchone()
+    assert row is not None
+    assert row["evidence_id"] == "ev_legacy"
+    assert row["name"] is None
+    conn.execute("UPDATE evidence_objects SET name = ? WHERE evidence_id = ?", ("named", "ev_legacy"))
+    assert conn.execute("SELECT name FROM evidence_objects").fetchone()["name"] == "named"
+    upgraded.close()
+
+
+def test_migration_3_adds_evidence_name_to_a_fresh_database(db: Database) -> None:
+    assert "name" in _evidence_name_column(db.connect())
 
 
 def test_migration_v2_enforces_foreign_keys_and_cascades(db: Database) -> None:

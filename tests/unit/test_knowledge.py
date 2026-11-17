@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -256,6 +257,167 @@ def test_operator_record_keeps_declared_evidence_class_without_warning(env: Serv
     assert write.entry.evidence_class is EvidenceClass.REPRODUCED
     assert [item.evidence_id for item in write.entry.evidence] == [ref.evidence_id]
     assert not any("downgraded" in warning for warning in write.entry.warnings), write.entry.warnings
+
+
+def test_record_reports_lifecycle_and_last_verified_at_downgrades(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    requested_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    request = RecordRequest(
+        namespace="shared",
+        entry=EntryPayload(
+            kind=Kind.OBSERVATION,
+            title="clamped claim",
+            claim="a published claim that carries a verification time",
+            lifecycle=Lifecycle.PUBLISHED,
+            last_verified_at=requested_at,
+        ),
+        idempotency_key="clamp-retry",
+    )
+
+    write = env.service.record(session, request)
+    assert write.entry.lifecycle is Lifecycle.CANDIDATE
+    assert write.entry.last_verified_at is None
+    assert (
+        "lifecycle downgraded from 'published' to 'candidate'"
+        ": an agent write stays a candidate until an independent reviewer promotes it"
+    ) in write.entry.warnings, write.entry.warnings
+    assert (
+        "last_verified_at downgraded from '2026-01-02T03:04:05.000000Z' to 'null'"
+        ": an agent write cannot declare its own verification time"
+    ) in write.entry.warnings, write.entry.warnings
+
+    replay = env.service.record(session, request)
+    assert replay.idempotent is True
+    assert replay.entry.warnings == write.entry.warnings
+
+
+def test_operator_record_keeps_lifecycle_and_verification_time_without_warning(
+    env: ServiceEnv,
+) -> None:
+    registration = env.register()
+    env.service.grants_add(registration.agent_id, "shared", "operator")
+    session = env.session(registration)
+    requested_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    write = env.service.record(
+        session,
+        RecordRequest(
+            namespace="shared",
+            entry=EntryPayload(
+                kind=Kind.OBSERVATION,
+                title="operator state claim",
+                claim="the operator keeps the published state and the verification time",
+                lifecycle=Lifecycle.PUBLISHED,
+                last_verified_at=requested_at,
+            ),
+        ),
+    )
+
+    assert write.entry.lifecycle is Lifecycle.PUBLISHED
+    assert write.entry.last_verified_at == requested_at
+    assert not any("downgraded" in warning for warning in write.entry.warnings), write.entry.warnings
+
+
+def test_record_persists_evidence_name(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    marker = "n73-labeled-evidence"
+    stored = env.evidence.put(b"named output\n", "text/plain")
+    ref = EvidenceRef(
+        evidence_id=stored.evidence_id,
+        sha256=stored.sha256,
+        size_bytes=stored.size_bytes,
+        media_type="text/plain",
+        name=marker,
+    )
+    write = env.service.record(
+        session,
+        RecordRequest(
+            namespace="shared",
+            entry=EntryPayload(
+                kind=Kind.OBSERVATION,
+                title="named evidence",
+                claim="the evidence name survives the write",
+                evidence=(ref,),
+            ),
+        ),
+    )
+
+    assert [item.name for item in write.entry.evidence] == [marker]
+    fetched = env.service.get_entry(session, write.entry.entry_id)
+    assert [item.name for item in fetched.evidence] == [marker]
+    row = (
+        env.db.connect()
+        .execute("SELECT name FROM evidence_objects WHERE evidence_id = ?", (ref.evidence_id,))
+        .fetchone()
+    )
+    assert row["name"] == marker
+
+
+async def test_record_tool_surfaces_evidence_name(env: ServiceEnv) -> None:
+    registration = env.register()
+    stored = env.evidence.put(b"tool named output\n", "text/plain")
+    envelope = await call_tool(
+        env.service,
+        "record",
+        {
+            "namespace": "shared",
+            "entry": {
+                "kind": "observation",
+                "title": "tool named claim",
+                "claim": "the tool response carries the evidence name",
+                "evidence": [
+                    {
+                        "evidence_id": stored.evidence_id,
+                        "sha256": stored.sha256,
+                        "size_bytes": stored.size_bytes,
+                        "media_type": "text/plain",
+                        "name": "n73-tool-name",
+                    }
+                ],
+            },
+        },
+        registration.session_token,
+    )
+
+    assert envelope["ok"] is True, envelope
+    assert [item["name"] for item in envelope["data"]["entry"]["evidence"]] == ["n73-tool-name"]
+
+
+def test_propose_revision_reports_pending_revision(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    original = _record(env, session, "correction target for the pending report")
+    write = env.service.propose_revision(
+        session,
+        ProposeRevisionRequest(
+            entry_id=original.entry.entry_id,
+            expected_revision=original.entry.revision_id,
+            entry=EntryPayload(
+                kind=Kind.OBSERVATION,
+                title="correction target",
+                claim="correction target for the pending report, revised",
+                lifecycle=Lifecycle.PUBLISHED,
+                last_verified_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            ),
+        ),
+    )
+
+    assert write.created is True
+    assert write.pending_revision_id == write.entry.revision_id
+    assert write.entry.revision_id != original.entry.revision_id
+    assert write.entry.current_revision_id == original.entry.revision_id
+    assert any(
+        "is pending and is not current" in warning
+        and write.entry.revision_id in warning
+        and original.entry.revision_id in warning
+        for warning in write.entry.warnings
+    ), write.entry.warnings
+    assert any(warning.startswith("lifecycle downgraded") for warning in write.entry.warnings)
+    assert any(warning.startswith("last_verified_at downgraded") for warning in write.entry.warnings)
+    pending = [item for item in write.entry.history if item.revision_id == write.entry.revision_id]
+    assert pending and pending[0].is_current is False
+
+    served = env.service.get_entry(session, original.entry.entry_id)
+    assert served.revision_id == original.entry.revision_id
+    assert served.current_revision_id == original.entry.revision_id
 
 
 def test_claim_size_limit(env: ServiceEnv) -> None:
