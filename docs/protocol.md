@@ -9,8 +9,10 @@ SPDX-License-Identifier: ISC
 
 - Application version: `0.1.0` (this repository may be an unreleased 0.1.0).
 - Bridge/MCP wire protocol version: `1.0`.
-- Schema version: `2` (database migration level; `MAX_VERSION` in
-  `src/knowlage_mcp/migrations.py` is authoritative).
+- Schema version: `3` (database migration level; `MAX_VERSION` in
+  `src/knowlage_mcp/migrations.py` is authoritative). Version 3 adds
+  `evidence_objects.name`. The change is additive, so a database created at
+  version 2 upgrades in place and its existing rows read `name: null`.
 
 `get_protocol_info` returns the protocol version, application version, schema
 version, tool names, the skill resource URI, and feature flags, with no
@@ -53,7 +55,7 @@ multiplexing below). Tool results are a single JSON text block.
 | `search` | `query`, `filters?` (namespace, kinds, lifecycle, evidence_class, tags, scope, include_candidates, author_agent_id), `max_results?`, `max_bytes?`, `cursor?` | `SearchResponse` (results with entry/revision IDs, snippets, scope, evidence label, score, time, and `selection_reasons`; total; truncated flag; opaque `next_cursor`; `approx_bytes`; `estimated_tokens` with `token_estimate_method`) |
 | `get_entry` | `entry_id`, `revision_id?`, `page?`, `cursor?` | bounded `EntryDetail` page: full revision fields, sources, evidence references, attached reviews; history pages on request |
 | `record` | `namespace`, `entry` (see payload below), `idempotency_key?` | the stored entry (dedupe may return an existing entry ID) |
-| `propose_revision` | `entry_id`, `expected_revision`, `entry`, `idempotency_key?` | the new candidate revision; `REVISION_CONFLICT` when stale |
+| `propose_revision` | `entry_id`, `expected_revision`, `entry`, `idempotency_key?` | the new candidate revision in `entry` plus `pending_revision_id`; it stays pending until reviewed, so `entry.current_revision_id` still names the served revision; `REVISION_CONFLICT` when stale |
 | `record_outcome` | `outcome`, `task_label?`, `revision_ids[]`, `notes?`, `idempotency_key?` | the stored outcome |
 | `review_next` | `filters?` | a leased `ReviewJob` (job ID, entry, revision, priority, lease expiry) or an empty-queue report |
 | `submit_review` | `entry_id`, `revision_id`, `result` (`supports`\|`contradicts`\|`inconclusive`\|`duplicate`\|`out_of_scope`), `method`, `job_id?`, `lease_id?`, `evidence?`, `conditions?`, `limitations?`, `evidence_class?`, `idempotency_key?` | `SubmitReviewResult`: `review_id`, `entry_id`, `revision_id`, `lifecycle` (the revision lifecycle after the decision), `evidence_class`, `published` (true when the decision moved the entry to `published`), `job_state` (default `done`), `entry_current_revision_id` (the entry's current revision after the write) |
@@ -80,12 +82,50 @@ The `entry` payload for `record` and `propose_revision` is `EntryPayload`:
 An agent write cannot self-declare verification. `record` stores the
 `candidate` lifecycle and `unverified` evidence class unless the caller holds
 the operator role, and `propose_revision` always stores a candidate revision
-with `unverified`. That rule keeps a self-declared class from raising retrieval
-rank or review priority. When a call requests a stronger `evidence_class` than
-the store will accept, the write proceeds and the response carries an explicit
-`warnings` entry naming the requested and the stored class, so the clamp is
-visible to the caller. Attached `evidence` references are stored with the
+with `unverified` and no `last_verified_at`. That rule keeps a self-declared
+class from raising retrieval rank or review priority.
+
+A write never discards a requested value silently. When `evidence_class`,
+`lifecycle`, or `last_verified_at` cannot be stored as requested, the write
+proceeds and `warnings` carries one entry per affected field, naming the field,
+the requested value, and the stored value:
+
+- `lifecycle downgraded from 'published' to 'candidate': an agent write stays a
+  candidate until an independent reviewer promotes it`
+- `last_verified_at downgraded from '2026-01-02T03:04:05.000000Z' to 'null': an
+  agent write cannot declare its own verification time`
+- `evidence_class downgraded from 'reproduced' to 'unverified': agent writes
+  stay unverified until an independent review sets the class`
+
+The downgrade is reported on the write response, because that is where the
+requested value is known. The warnings are stored with the idempotent
+response, so a retry reports the same downgrades. `get_entry` reports the
+stored values only. Attached `evidence` references are stored with the
 revision either way.
+
+`propose_revision` returns the new candidate revision in `entry`, sets
+`created: true`, and puts the new revision id in `pending_revision_id`. The
+revision is not served: `entry.current_revision_id` still names the previous
+revision, `entry.history` marks the new revision `is_current: false`, and
+`warnings` states that the revision is pending. Independent review and
+promotion is the only way the correction becomes current.
+
+An evidence reference accepts `sha256`, `size_bytes`, `media_type`, `name`, and
+`redacted` beside `evidence_id`. The gateway stores the metadata and the
+caller-supplied `name` when the object is attached and returns the same values
+from `record`, `propose_revision`, and `get_entry`. An omitted `name` leaves a
+previously recorded name in place.
+
+An evidence object is single-attachment. Once a revision attaches an evidence
+object, another revision that names the same `evidence_id` is rejected with
+`INVALID_ARGUMENT` (`evidence object is already attached to another revision`).
+Objects are content-addressed, so that rule guarantees one stored name and one
+owning revision per object. Reusing one object on several revisions is not
+supported.
+
+Scope is case-insensitive. `record` and `propose_revision` store every scope
+value trimmed and lowercased, and matching folds case on both sides, so
+`repository: "Acme/Widget"` is stored and returned as `acme/widget`.
 
 ## Error envelope and codes
 
