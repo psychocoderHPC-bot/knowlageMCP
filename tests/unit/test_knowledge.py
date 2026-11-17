@@ -137,6 +137,40 @@ def test_record_persists_evidence_and_reports_evidence_class_downgrade(env: Serv
     ), write.entry.warnings
 
 
+def test_record_idempotent_retry_reports_evidence_class_downgrade(env: ServiceEnv) -> None:
+    session = env.session(env.register())
+    ref = _evidence_ref(env, b"retry output\n")
+    request = RecordRequest(
+        namespace="shared",
+        entry=EntryPayload(
+            kind=Kind.OBSERVATION,
+            title="retried claim",
+            claim="the downgrade warning survives an idempotent retry",
+            evidence=(ref,),
+            evidence_class=EvidenceClass.REPRODUCED,
+        ),
+        idempotency_key="downgrade-retry",
+    )
+
+    first = env.service.record(session, request)
+    assert first.idempotent is False
+    assert first.entry.evidence_class is EvidenceClass.UNVERIFIED
+    assert any(
+        "evidence_class" in warning and "reproduced" in warning and "unverified" in warning
+        for warning in first.entry.warnings
+    ), first.entry.warnings
+
+    replay = env.service.record(session, request)
+    assert replay.idempotent is True
+    assert replay.entry.entry_id == first.entry.entry_id
+    assert replay.entry.revision_id == first.entry.revision_id
+    assert [item.evidence_id for item in replay.entry.evidence] == [ref.evidence_id]
+    assert any(
+        "evidence_class" in warning and "reproduced" in warning and "unverified" in warning
+        for warning in replay.entry.warnings
+    ), replay.entry.warnings
+
+
 def test_propose_revision_persists_evidence_and_reports_evidence_class_downgrade(
     env: ServiceEnv,
 ) -> None:
